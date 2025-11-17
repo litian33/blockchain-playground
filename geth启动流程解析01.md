@@ -37,7 +37,56 @@ func init() {
 		initCommand, // 创世命令
         // ...other commands
     }
+	sort.Sort(cli.CommandsByName(app.Commands))
+
+    // 这里会注册命令支持接收的各种参数，定义的时候是分组的方便可读，这里使用时是混在一起的
+	app.Flags = flags.Merge(
+		nodeFlags,
+		rpcFlags,
+		consoleFlags,
+		debug.Flags,
+		metricsFlags,
+	)
+    // 为上面支持的参数自动生成对应的环境变量
+    // 参数优先级：命令行参数 > 环境变量 > 配置文件 > 默认值
+	flags.AutoEnvVars(app.Flags, "GETH")
+
+	app.Before = func(ctx *cli.Context) error {
+        // 自动设置 GOMAXPROCS 值以匹配 Linux 容器的 CPU 配额。
+		maxprocs.Set() 
+		flags.MigrateGlobalFlags(ctx)
+        // - 设置调试相关的配置，如日志级别、性能分析等。
+		if err := debug.Setup(ctx); err != nil {
+			return err
+		}
+        // 检查环境变量参数是否有命令行参数不支持的情况
+		flags.CheckEnvVars(ctx, app.Flags, "GETH")
+		return nil
+	}
+    // 注册退出清理函数
+	app.After = func(ctx *cli.Context) error {
+		debug.Exit()
+		prompt.Stdin.Close() // Resets terminal mode.
+		return nil
+	}
 }
+```
+
+init 方法的处理流程如下图所示：
+```mermaid
+graph TD
+A[注册 geth 主函数] --> B[注册子命令]
+B --> C[添加命令行参数]
+C --> D[自动添加环境变量参数]
+D --> E[注册启动回调]
+E--> F[处理GOMAXPROCS]
+E --> G[合并全局参数]
+E --> H[设置调试参数]
+E --> I[检查环境变量]
+F --> X[注册结束回调]
+G --> X
+H --> X
+I --> X
 ```
 
 还有下面的 main 方法，他会用到上面定义的命令行 app 对象，这里它无关紧要，启动命令行工具逻辑而已，不用关注。
@@ -76,22 +125,23 @@ func geth(ctx *cli.Context) error {
 
 ### 3. prepare()函数
 
-prepare函数不包含什么复杂的逻辑，主要就是一些前置条件检查，各种参数检查，下面是我魔改增加注释的代码：
+prepare函数不包含什么复杂的逻辑，主要就是一些前置条件检查，各种参数检查，下面增加注释的代码：
 
 ```go
 func prepare(ctx *cli.Context) {
-	// If we're running a known preset, log it for convenience.
 	switch {
-    // 各种测试网络开关检查
+    // 各种测试网络开关检查,goerli,sepolia,holesky以及dev 开关，这里只是打印出日志信息，并没有做任何处理
 	case ctx.IsSet(utils.GoerliFlag.Name):
 		log.Info("Starting Geth on Görli testnet...")
-    // case .....
-    // 检查是否是主网
+    // ...
+
+    // 如果没有设置networkid参数，默认就是主网模式启动
 	case !ctx.IsSet(utils.NetworkIdFlag.Name):
 		log.Info("Starting Geth on Ethereum mainnet...")
 	}
-    // 下面的逻辑是在没有明确指定--cachecache参数，且是主网时，设置缓存默认值4096
-    // .....
+    // 下面的逻辑是在没有明确指定--cache参数，且是主网时(没有指定networkid参数)，设置缓存默认值4096
+    // 并且需要满足没有设置各种测试网和 dev 开关
+    // ⚠️注意！这里如果是基于以太坊开发的项目，且主网 ID 不是 1 的情况，需要自行修改此处代码或者显示指定 cache 参数，否则会导致缓存过小，影响性能
 	ctx.Set(utils.CacheFlag.Name, strconv.Itoa(4096))
     // .....
 
@@ -103,31 +153,62 @@ func prepare(ctx *cli.Context) {
 }
 ```
 
-> 注意，这个方法并没有返回值，但是它直接修改了cli.Context对象内的取值，会影响后续逻辑。
-> 
+> 注意，这个方法并没有返回值，但是它直接修改了cli.Context对象内的取值(其实只修改了 cache 缓存参数)，会影响后续逻辑。
+>
+
 ### 4. makeFullNode()函数 - 创建完整节点
 
 这是启动流程中最核心的部分，负责创建并配置完整的以太坊节点：
 
 ```go
+// cmd/geth/config.go
 func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 	// 加载配置
 	stack, cfg := makeConfigNode(ctx)
+    // 设置覆盖分叉参数 OverrideShanghai, OverrideCancun,OverrideVerkle
+	if ctx.IsSet(utils.OverrideShanghai.Name) {
+		v := ctx.Uint64(utils.OverrideShanghai.Name)
+		cfg.Eth.OverrideShanghai = &v
+	}
+    // ...
 	// 注册以太坊服务
 	backend, eth := utils.RegisterEthService(stack, &cfg.Eth)
-	// 注册其他可选服务(不同版本的代码，这里有不少变动，大致逻辑如此)
-    // 这里面注册的东西后面都值得单独分析成文，这里就暂时不深入，东西太多了
-	registerShhService(stack, &cfg.Shh)
-	registerEthStatsService(stack, backend, cfg.Ethstats.URL)
-	registerGraphQLService(stack, backend, cfg.Node)
-	registerFilterAPI(stack, backend)
-	registerCliqueService(stack, &cfg.Node, &cfg.Eth)
-	
-	// 如果启用了dashboard，则注册相关服务
-	if ctx.GlobalBool(utils.DashboardEnabledFlag.Name) {
-		registerDashboard(stack, &cfg.Dashboard, gitCommit, gitDate)
+	// 注册节点健康指标
+    // ...
+	// 注册 log filter RPC API.
+	filterSystem := utils.RegisterFilterAPI(stack, backend, &cfg.Eth)
+
+	// 注册 GraphQL
+	if ctx.IsSet(utils.GraphQLEnabledFlag.Name) {
+		utils.RegisterGraphQLService(stack, backend, filterSystem, &cfg.Node)
 	}
-	
+	// 注册 Ethereum Stats 服务
+	if cfg.Ethstats.URL != "" {
+		utils.RegisterEthStatsService(stack, backend, cfg.Ethstats.URL)
+	}
+	// 配置 full-sync 测试服务 (测试)
+	if ctx.IsSet(utils.SyncTargetFlag.Name) {
+		hex := hexutil.MustDecode(ctx.String(utils.SyncTargetFlag.Name))
+		if len(hex) != common.HashLength {
+			utils.Fatalf("invalid sync target length: have %d, want %d", len(hex), common.HashLength)
+		}
+		utils.RegisterFullSyncTester(stack, eth, common.BytesToHash(hex))
+	}
+	// 开发模式下自动创建一个模拟的 Beacon 链，可以本地不依赖其他环境进行测试
+	if ctx.IsSet(utils.DeveloperFlag.Name) {
+		simBeacon, err := catalyst.NewSimulatedBeacon(ctx.Uint64(utils.DeveloperPeriodFlag.Name), eth)
+		if err != nil {
+			utils.Fatalf("failed to register dev mode catalyst service: %v", err)
+		}
+		catalyst.RegisterSimulatedBeaconAPIs(stack, simBeacon)
+		stack.RegisterLifecycle(simBeacon)
+	} else {
+        // 注册标准的 Catalyst 服务，用于与外部共识客户端（如 Lighthouse、Prysm 等）交互
+		err := catalyst.Register(stack, eth)
+		if err != nil {
+			utils.Fatalf("failed to register catalyst service: %v", err)
+		}
+	}
 	return stack, backend
 }
 ```
@@ -142,7 +223,8 @@ makeFullNode主要做了两件事：
 
 ```go
 func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
-    // 创建默认配置
+    // 创建默认配置 (这两步是在loadBaseConfig逻辑中，为了方便查看，这里展开了)
+    // 这个对象包含了所有的默认参数配置，如果命令行参数、环境变量、配置文件中都没有配置这些参数，则使用这里的默认值
 	cfg := gethConfig{
 		Eth:     ethconfig.Defaults,
 		Node:    defaultNodeConfig(),
@@ -155,6 +237,7 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
 
 	// 应用命令行标志，根据命令行参数更新 cfg 配置对象
 	utils.SetNodeConfig(ctx, &cfg.Node)
+    // 展开的loadBaseConfig逻辑到此为止
 
 	// 创建Node实例(P2P 节点，并提供 RPC 服务)
 	stack, err := node.New(&cfg.Node)
@@ -162,13 +245,21 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
 		Fatalf("Failed to create the protocol stack: %v", err)
 	}
 	
+	// 账户管理后面再说
+	if err := setAccountManagerBackends(stack.Config(), stack.AccountManager(), stack.KeyStoreDir()); err != nil {
+		utils.Fatalf("Failed to set account manager backends: %v", err)
+	}
+
 	// 应用Eth 服务配置
 	utils.SetEthConfig(ctx, stack, &cfg.Eth)
-	
-	// 应用其他配置
-	utils.SetShhConfig(ctx, stack, &cfg.Shh)
-	utils.SetDashboardConfig(ctx, &cfg.Dashboard)
-	
+
+    // 如果配置了 EthStats 服务器的 URL，则进行设置
+	if ctx.IsSet(utils.EthStatsURLFlag.Name) {
+		cfg.Ethstats.URL = ctx.String(utils.EthStatsURLFlag.Name)
+	}
+
+    // 应用 指标 配置，后面再说
+	applyMetricConfig(ctx, &cfg)
 	return stack, cfg
 }
 ```
@@ -176,6 +267,7 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
 #### 4.2 RegisterEthService() - 注册以太坊核心服务
 
 ```go
+// cmd/utils/flags.go
 func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (ethapi.Backend, *eth.Ethereum) {
 	// 创建Ethereum实例
 	backend, err := eth.New(stack, cfg)
@@ -209,9 +301,9 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 ```
 
 startNode函数主要完成：
-1. 调用stack.Start()启动所有已注册的服务
-2. 解锁指定账户（如果有配置）
-3. 启动挖矿服务（如果有配置）
+1. 调用stack.Start()启动所有已注册的服务 (会在节点那层详细介绍)
+2. 解锁指定账户（如果有配置） (以后介绍)
+3. 启动挖矿服务（如果有配置） (以后介绍)
 
 ### 6. stack.Wait() - 等待中断信号
 
@@ -228,3 +320,5 @@ Geth的启动流程虽然看起来简单，但背后涉及了大量的初始化�
 5. **运行等待** - 等待外部中断信号
 
 每个环节都有其特定的职责，共同构成了Geth完整的启动流程。
+
+麻烦的是启动流程涉及到多层调用，总结时不清楚在哪一层总结，展开太细也不好，都是细节就乱了。这个还是边写边回头修改整理吧。
