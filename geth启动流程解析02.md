@@ -203,7 +203,7 @@ type Config struct {
 	// 单笔交易手续费上限
 	RPCTxFeeCap float64
 
-	// 下面几个参数用了重置分叉参数的
+	// 下面几个参数用来重置分叉参数
 	OverrideShanghai *uint64 `toml:",omitempty"`
 	OverrideCancun *uint64 `toml:",omitempty"`
 	OverrideVerkle *uint64 `toml:",omitempty"`
@@ -215,139 +215,188 @@ type Config struct {
 节点配置主要包含节点名称、数据目录、钥匙库配置、外部签名者、HTTP模块、WS模块、P2P配置等等。
 ```go
 // cmd/node/config.go
+// 配置参数太多，其实有些无关紧要的属性没必要关注，不影响逻辑，这里我就把它干掉了，只保留我认为重要的属性
 type Config struct {
-	// 节点名称
-	Name string
-	
-	// 数据目录
+	// 主数据目录
 	DataDir string
-	
-	// 钥匙库配置
-	KeyStoreDir string
-	
-	// 外部签名者
-	ExternalSigner string
-	
-	// HTTP模块
-	HTTPModules []string
-	
-	// WS模块
-	WSModules []string
-	
-	// P2P配置
+
+	// P2P网络配置
 	P2P p2p.Config
-	
-	// ...
+
+	// KeyStoreDir是包含私钥的文件系统文件夹。
+	// 如果KeyStoreDir为空，则默认位置是DataDir的"keystore"子目录。
+	KeyStoreDir string `toml:",omitempty"`
+
+	// ExternalSigner指定外部URI用于clef类型的签名
+	ExternalSigner string `toml:",omitempty"`
+
+	// 允许用户在不安全的http环境中解锁账户
+	InsecureUnlockAllowed bool `toml:",omitempty"`
+
+	// 存放IPC端点的请求位置。
+	IPCPath string
+
+	// HTTP RPC服务器的主机接口，为空不启用 http 服务
+	HTTPHost string
+
+	// HTTP RPC服务器监听端口号，默认零值有效，并且将随机选择一个端口号
+	HTTPPort int `toml:",omitempty"`
+
+	// 发送给请求客户端的跨域资源共享头。
+	HTTPCors []string `toml:",omitempty"`
+
+	// 通过HTTP RPC接口公开的API模块列表，如果为空则公开所有公共模块
+	HTTPModules []string
+
+	// 自定义HTTP RPC接口使用的超时值。
+	HTTPTimeouts rpc.HTTPTimeouts
+
+	// http-rpc服务的路径前缀。
+	HTTPPathPrefix string `toml:",omitempty"`
+
+	// 提供认证API的监听地址。
+	AuthAddr string `toml:",omitempty"`
+
+	// 提供认证API的端口号。
+	AuthPort int `toml:",omitempty"`
+
+	// 启动websocket RPC服务器的主机接口，如果为空则不启用 ws
+	WSHost string
+	WSPort int `toml:",omitempty"`
+
+	// ws-rpc服务的路径前缀。
+	WSPathPrefix string `toml:",omitempty"`
+
+	// 接受websocket请求的域名列表。
+	WSOrigins []string `toml:",omitempty"`
+
+	// 通过websocket RPC接口公开的API模块列表，为空则公开所有公共模块
+	WSModules []string
+
+	// WebSocket RPC接口公开所有API模块（不仅是公共模块，这个开关比较危险，不建议使用）
+	WSExposeAll bool `toml:",omitempty"`
+
+	// 与p2p.Server一起使用的自定义记录器。
+	Logger log.Logger `toml:",omitempty"`
+
+	// 允许通过RPC发送非EIP-155保护的交易。
+	AllowUnprotectedTxs bool `toml:",omitempty"`
+
+	// 批次中请求的最大数量。
+	BatchRequestLimit int `toml:",omitempty"`
+
+	// 从批处理rpc调用返回的最大字节数。
+	BatchResponseMaxSize int `toml:",omitempty"`
+
+	// 十六进制编码的jwt密钥的路径。
+	JWTSecret string `toml:",omitempty"`
+
+	DBEngine string `toml:",omitempty"`
 }
 ```
+
 
 ## 配置加载过程
 
-配置加载主要在makeConfigNode()函数中完成：
+配置加载主要在makeConfigNode()函数中完成，这个函数的主体逻辑参考[4.1 makeConfigNode() - 创建基础配置](geth启动流程解析01.md#41-makeconfignode----创建基础配置)
+
+下面针对逻辑中的部分细节内容进行说明
+
+### 1. 加载默认
 
 ```go
-// cmd/geth/main.go
-func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
-	// 1. 加载配置
-	cfg := loadConfig(ctx)
-	
-	// 2. 应用节点配置
-	utils.SetNodeConfig(ctx, &cfg.Node)
-	
-	// 3. 创建Node实例
-	stack, err := node.New(&cfg.Node)
-	if err != nil {
-		Fatalf("Failed to create the protocol stack: %v", err)
+	cfg := gethConfig{
+		Eth:     ethconfig.Defaults,
+		Node:    defaultNodeConfig(),
+		Metrics: metrics.DefaultConfig,
 	}
-	
-	// 4. 应用以太坊配置
-	utils.SetEthConfig(ctx, stack, &cfg.Eth)
-	
-	return stack, cfg
-}
 ```
-
-### 1. loadConfig() - 加载配置文件
-
-```go
-// cmd/geth/config.go
-func loadConfig(ctx *cli.Context) gethConfig {
-	// 获取配置文件路径
-	path := ctx.GlobalString(configFileFlag.Name)
-	
-	// 如果没有指定配置文件，则使用默认配置
-	if path == "" {
-		return gethConfig{
-			Eth:      ethconfig.Defaults,
-			Node:     node.DefaultConfig,
-			Dashboard: dashboard.DefaultConfig,
-		}
-	}
-	
-	// 读取配置文件
-    var cfg gethConfig
-    // 读取配置文件并反序列化为gethConfig
-	
-	return cfg
-}
-```
+这里创建了一个默认的配置对象cfg，这个对象包含了Eth、Node和Metrics三个部分，都直设置了默认值。
+这里没啥好分析的，直接进去看默认值就行了。
 
 ### 2. SetNodeConfig() - 应用节点配置
 
 将命令行参数应用到node.Config中
 ```go
 // cmd/utils/flags.go
+// SetNodeConfig applies node-related command line flags to the config.
 func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
-	// 设置数据目录
-	setDataDir(ctx, cfg)
-	
-	// 设置P2P配置
-	setP2PConfig(ctx, &cfg.P2P)
-	
-	// 设置HTTP配置
-	setHTTPConfig(ctx, cfg)
-	
-	// 设置WebSocket配置
-	setWSConfig(ctx, cfg)
-	
+	// 设置P2P网络配置
+	SetP2PConfig(ctx, &cfg.P2P)
 	// 设置IPC配置
-	setIPCConfig(ctx, cfg)
-	
+	setIPC(ctx, cfg)
+	// 设置HTTP RPC服务器配置
+	setHTTP(ctx, cfg)
+	// 设置GraphQL服务器配置
+	setGraphQL(ctx, cfg)
+	// 设置Websocket RPC服务器配置
+	setWS(ctx, cfg)
+	// 设置节点标识
+	setNodeUserIdent(ctx, cfg)
+	// 设置数据目录
+	SetDataDir(ctx, cfg)
+	// 设置智能卡配置
+	setSmartCard(ctx, cfg)
+
+	// 设置JWT密钥，启用个人钱包，外部签名者URI，KeyStoreDir等
+	if ctx.IsSet(JWTSecretFlag.Name) {
+		cfg.JWTSecret = ctx.String(JWTSecretFlag.Name)
+	}
 	// ...
+
+	// 	设置数据库引擎
+	if ctx.IsSet(DBEngineFlag.Name) {
+		dbEngine := ctx.String(DBEngineFlag.Name)
+		if dbEngine != "leveldb" && dbEngine != "pebble" {
+			Fatalf("Invalid choice for db.engine '%s', allowed 'leveldb' or 'pebble'", dbEngine)
+		}
+		log.Info(fmt.Sprintf("Using %s as db engine", dbEngine))
+		cfg.DBEngine = dbEngine
+	}
 }
 ```
+
+上面一大SetXXX 其实没有包含复杂逻辑，主要实现的功能就是从 ctx 上下文中读取命令行参数的值，然后谁知道 cfg 对象对应的属性上，以后按需查看就行，不需要花费精力研究这块代码。
 
 ### 3. SetEthConfig() - 应用以太坊配置
 
 ```go
 // cmd/utils/flags.go
 func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
-	// 设置网络ID
-	if ctx.GlobalIsSet(utils.NetworkIdFlag.Name) {
-		cfg.NetworkId = ctx.GlobalUint64(utils.NetworkIdFlag.Name)
-	}
-	
-	// 设置同步模式
-	if ctx.GlobalIsSet(utils.SyncModeFlag.Name) {
-		mode, err := downloader.ParseSyncMode(getString(ctx, utils.SyncModeFlag.Name))
-		if err != nil {
-			Fatalf("Failed to parse sync mode: %v", err)
-		}
-		cfg.SyncMode = mode
-	}
-	
-	// 设置交易池配置
-	setTxPool(ctx, &cfg.TxPool)
-	
-	// 设置Gas价格预言机配置
+	// 这里会进行一些冲突检查
+	CheckExclusive(ctx, MainnetFlag, DeveloperFlag, GoerliFlag, SepoliaFlag, HoleskyFlag)
+	// 不能同时使用内嵌解锁和外部签名
+	CheckExclusive(ctx, DeveloperFlag, ExternalSignerFlag) 
+
+	// 设置以太坊的各种组件参数
+	setEtherbase(ctx, cfg)
 	setGPO(ctx, &cfg.GPO)
-	
-	// 设置挖矿配置
+	setTxPool(ctx, &cfg.TxPool)
 	setMiner(ctx, &cfg.Miner)
+	setRequiredBlocks(ctx, cfg)
+	setLes(ctx, cfg)
 	
+	// GC 优化设置（TODO 后继单独深入分析）
+
+	// 网络 ID、GC 模式、缓存、Fee等设置
+	// ...
+
+	// 默认配置覆盖，如开发网络等
+	switch {
+	case ctx.Bool(MainnetFlag.Name):
+		if !ctx.IsSet(NetworkIdFlag.Name) {
+			cfg.NetworkId = 1
+		}
+		cfg.Genesis = core.DefaultGenesisBlock()
+		SetDNSDiscoveryDefaults(cfg, params.MainnetGenesisHash)
+	// ...
+	}
 	// ...
 }
 ```
+
+## 服务注册
+在上一篇文章的[4.1 makeConfigNode() - 创建基础配置](geth启动流程解析01.md#4.makeFullNode()----创建完整节点) 章节，除了加载配置之外，还包含了一系列的 utils.RegisterXXX(stack, ...) 服务注册逻辑，这部分内容这里不展开，因为他们针对 Node 对象进行操作，下一篇文章会细化分析。
 
 ## 配置验证
 
