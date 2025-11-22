@@ -11,29 +11,37 @@ Node结构体是Geth中最重要的容器组件：
 ```go
 // node/node.go
 type Node struct {
-	eventmux *event.TypeMux // Legacy event mux, deprecate for `feed`
+	// 并发锁
+	eventmux *event.TypeMux 
+	// node配置信息（可参考上一章节的节点配置内容）
 	config   *Config
+	// 帐号管理器
 	accman   *accounts.Manager
-	database ethdb.Database // 数据库实例
-	server   *p2p.Server    // P2P服务器
-	// 各种服务注册信息
-	serviceFuncs []ServiceFunc
-	services map[reflect.Type]Service
-	
-	// 状态管理
-	stateLock sync.RWMutex
-	state     int // 节点状态 (unknown, closed, opening, open)
+	// 日志记录
+	log           log.Logger
+	keyDir        string        // keystore 存放目录
+	keyDirTemp    bool          // 如果为true，生成的keystore目录为临时，停止后会删除
+	dirLock       *flock.Flock  // 目录并发锁，避免多个实例使用
+	stop          chan struct{} // 终止信号接收Channel
 
-	lifecycles    []Lifecycle // All registered backends, services, and auxiliary services that have a lifecycle
+	server        *p2p.Server   // P2P 网络层服务实例
+	startStopLock sync.Mutex    // 启动停止锁（这个是在通用锁之上附加）
+	state         int           // node生命周期状态 (initializingState/runningState/closedState)
+
+	// 节点内部逻辑通用锁
+	lock          sync.Mutex
+	lifecycles    []Lifecycle // 所有注册的 backends, services, 和一些辅助的服务lifecycle
+
     // RPC相关
-	rpcAPIs       []rpc.API   // List of APIs currently provided by the node
+	rpcAPIs       []rpc.API   // node提供的 APIs
 	http          *httpServer //
 	ws            *httpServer //
 	httpAuth      *httpServer //
 	wsAuth        *httpServer //
-	ipc           *ipcServer  // Stores information about the ipc http server
-	inprocHandler *rpc.Server // In-process RPC request handler to process the API requests
+	ipc           *ipcServer  // ipc http server
+	inprocHandler *rpc.Server // In-process RPC 请求处理器
 
+	databases map[*closeTrackingDB]struct{} // node使用的多个数据库
 }
 ```
 
@@ -45,6 +53,10 @@ Node的创建主要通过New函数完成：
 // node/node.go
 // 创建一个P2P 节点, 支持协议注册
 func New(conf *Config) (*Node, error) {
+	// 克隆一个配置对象，避免Node运行过程中受影响
+	confCopy := *conf
+	conf = &confCopy
+
 	// 1. 验证配置，这里确保数据目录存在
 	if conf.DataDir != "" {
 		absdatadir, err := filepath.Abs(conf.DataDir)
@@ -53,16 +65,36 @@ func New(conf *Config) (*Node, error) {
 		}
 		conf.DataDir = absdatadir
 	}
-	
+	// 确认日志配置
+	if conf.Logger == nil {
+		conf.Logger = log.New()
+	}
+
 	// 2. 创建Node实例
+	// 下面这几步检查，确认实例名称不包含特殊字符和可能冲突的关键字，如keystore/.ipc，避免覆盖关键文件
+	if strings.ContainsAny(conf.Name, `/\`) {
+		return nil, errors.New(`Config.Name must not contain '/' or '\'`)
+	}
+	if conf.Name == datadirDefaultKeyStore {
+		return nil, errors.New(`Config.Name cannot be "` + datadirDefaultKeyStore + `"`)
+	}
+	if strings.HasSuffix(conf.Name, ".ipc") {
+		return nil, errors.New(`Config.Name cannot end in ".ipc"`)
+	}
+	// 创建RPC服务实例（TODO RPC服务逻辑，后面单独分析）
 	server := rpc.NewServer()
+	// 设置rpc服务的批量请求和响应限制，附上默认值
+	// BatchRequestLimit:    1000,
+	// BatchResponseMaxSize: 25 * 1000 * 1000,
 	server.SetBatchLimits(conf.BatchRequestLimit, conf.BatchResponseMaxSize)
+	// 创建node实例对象
 	node := &Node{
 		config:        conf,
 		inprocHandler: server,
 		eventmux:      new(event.TypeMux),
 		log:           conf.Logger,
 		stop:          make(chan struct{}),
+		// 这里使用P2P配置创建一个p2p服务实例（TODO p2p协议逻辑，也需要后面单独分析）
 		server:        &p2p.Server{Config: conf.P2P},
 		databases:     make(map[*closeTrackingDB]struct{}),
 	}
@@ -74,15 +106,25 @@ func New(conf *Config) (*Node, error) {
 	if err := node.openDataDir(); err != nil {
 		return nil, err
 	}
-	
-	// 5. 创建一个空的账户管理器
+	// 获取或创建keystore目录（如果配置直接使用，否则使用datadir/keystore，如果datadir也没配置就创建临时目录go-ethereum-keystore）
+	keyDir, isEphem, err := conf.GetKeyStoreDir()
+	if err != nil {
+		return nil, err
+	}
+	node.keyDir = keyDir
+	node.keyDirTemp = isEphem
+
+	// 5. 创建一个空的账户管理器(下面的流程会进行设置)
 	node.accman = accounts.NewManager(&accounts.Config{InsecureUnlockAllowed: conf.InsecureUnlockAllowed})
 	
 	// 6. 初始化P2P服务器
+	// 这一步会读取nodekey（如果没有，它会自动创建一个，类似bootnode -genkey 的效果）
 	node.server.Config.PrivateKey = node.config.NodeKey()
 	node.server.Config.Name = node.config.NodeName()
 	node.server.Config.Logger = node.log
+	// 检查历史无效的配置文件（如datadir下的static-nodes.json，新版本已经失效，需要从配置文件的P2P.StaticNodes中读取）
 	node.config.checkLegacyFiles()
+	// 配置节点数据库（用来存储发现的P2P节点信息）
 	if node.server.Config.NodeDatabase == "" {
 		node.server.Config.NodeDatabase = node.config.NodeDB()
 	}
@@ -97,8 +139,76 @@ func New(conf *Config) (*Node, error) {
 	return node, nil
 }
 ```
+### 1. 内置rpcAPIs - RPC服务注册
 
-### 1. openDataDir() - 数据目录初始化
+```go
+// node/api.go
+// Node内置的RPC APIs
+func (n *Node) apis() []rpc.API {
+	return []rpc.API{
+		{
+			Namespace: "admin",
+			Service:   &adminAPI{n},
+		}, {
+			Namespace: "debug",
+			Service:   debug.Handler,
+		}, {
+			Namespace: "web3",
+			Service:   &web3API{n},
+		},
+	}
+}
+```
+内置服务主要是包含了 admin/debug/web3 几个名称空间下的服务接口，具体接口可以查看源代码内容。注意，这些接口注册的是In-Proc，就是通过geth控制台可以访问的接口。
+
+以下是三个 namespace 支持的方法列表：
+
+#### admin namespace 方法列表 (adminAPI 结构体)
+
+- **AddPeer(url string) (bool, error)** - 添加对等节点
+- **RemovePeer(url string) (bool, error)** - 移除对等节点  
+- **AddTrustedPeer(url string) (bool, error)** - 添加可信对等节点
+- **RemoveTrustedPeer(url string) (bool, error)** - 移除可信对等节点
+- **PeerEvents(ctx context.Context) (*rpc.Subscription, error)** - 订阅对等节点事件
+- **StartHTTP(host *string, port *int, cors *string, apis *string, vhosts *string) (bool, error)** - 启动 HTTP RPC 服务器
+- **StartRPC(host *string, port *int, cors *string, apis *string, vhosts *string) (bool, error)** - 启动 RPC 服务器 (已弃用，使用 StartHTTP)
+- **StopHTTP() (bool, error)** - 停止 HTTP 服务器
+- **StopRPC() (bool, error)** - 停止 RPC 服务器 (已弃用，使用 StopHTTP)
+- **StartWS(host *string, port *int, allowedOrigins *string, apis *string) (bool, error)** - 启动 WebSocket RPC 服务器
+- **StopWS() (bool, error)** - 停止 WebSocket 服务器
+- **Peers() ([]*p2p.PeerInfo, error)** - 获取所有对等节点信息
+- **NodeInfo() (*p2p.NodeInfo, error)** - 获取本节点信息
+- **Datadir() string** - 获取数据目录路径
+
+#### debug namespace 方法列表 (HandlerT 结构体)
+- **Verbosity(level int)** - 设置日志详细级别
+- **Vmodule(pattern string) error** - 设置日志详细模式
+- **MemStats() *runtime.MemStats** - 获取内存统计信息
+- **GcStats() *debug.GCStats** - 获取 GC 统计信息
+- **CpuProfile(file string, nsec uint) error** - CPU 性能分析
+- **StartCPUProfile(file string) error** - 开始 CPU 性能分析
+- **StopCPUProfile() error** - 停止 CPU 性能分析
+- **GoTrace(file string, nsec uint) error** - Go 跟踪
+- **BlockProfile(file string, nsec uint) error** - 阻塞性能分析
+- **SetBlockProfileRate(rate int)** - 设置阻塞性能分析率
+- **WriteBlockProfile(file string) error** - 写入阻塞性能分析文件
+- **MutexProfile(file string, nsec uint) error** - 互斥锁性能分析
+- **SetMutexProfileFraction(rate int)** - 设置互斥锁性能分析率
+- **WriteMutexProfile(file string) error** - 写入互斥锁性能分析文件
+- **WriteMemProfile(file string) error** - 写入内存性能分析文件
+- **Stacks(filter *string) string** - 获取所有 goroutine 堆栈信息
+- **FreeOSMemory()** - 强制垃圾回收
+- **SetGCPercent(v int) int** - 设置垃圾回收百分比
+
+#### web3 namespace 方法列表 (web3API 结构体)
+
+- **ClientVersion() string** - 获取客户端版本
+- **Sha3(input hexutil.Bytes) hexutil.Bytes** - 计算 SHA3 哈希值
+
+这些方法提供了节点管理、调试工具和 Web3 实用程序的功能。
+
+
+### 2. openDataDir() - 数据目录初始化
 
 ```go
 func (n *Node) openDataDir() error {
@@ -113,7 +223,7 @@ func (n *Node) openDataDir() error {
 	}
     // 使用锁文件锁定当前的数据目录，防止并发访问误用数据目录
 	n.dirLock = flock.New(filepath.Join(instdir, "LOCK"))
-
+	// 这里就会进行并发检查，如果已经有一个geth进程占用这个目录，那么就会失败
 	if locked, err := n.dirLock.TryLock(); err != nil {
 		return err
 	} else if !locked {
@@ -123,7 +233,7 @@ func (n *Node) openDataDir() error {
 }
 ```
 
-### 2. accounts.NewManager() - 账户管理器初始化
+### 3. accounts.NewManager() - 账户管理器初始化
 
 ```go
 // accounts/manager.go
@@ -138,11 +248,13 @@ func NewManager(config *Config, backends ...Backend) *Manager {
     // 监听账户更新
 	updates := make(chan WalletEvent, managerSubBufferSize)
 
+	// 监听所有注册的后端服务
 	subs := make([]event.Subscription, len(backends))
 	for i, backend := range backends {
 		subs[i] = backend.Subscribe(updates)
 	}
-	// Assemble the account manager and return
+
+	// 组装账户管理器
 	am := &Manager{
 		config:      config,
 		backends:    make(map[reflect.Type][]Backend),
@@ -153,6 +265,7 @@ func NewManager(config *Config, backends ...Backend) *Manager {
 		quit:        make(chan chan error),
 		term:        make(chan struct{}),
 	}
+	// 按backend类型分类存放
 	for _, backend := range backends {
 		kind := reflect.TypeOf(backend)
 		am.backends[kind] = append(am.backends[kind], backend)
@@ -165,11 +278,24 @@ func NewManager(config *Config, backends ...Backend) *Manager {
 }
 ```
 
-### 3. P2P服务器初始化
+backend后端服务指的是实现了下面这个账户Backend接口的所有对象，钱包专项后面有专题研究（TODO）：
+```go
+// accounts/accounts.go
+// Backend是一个 Wallet Provider，它拥有一个或多个账户，可以用来签名，可能是各种硬件、软件服务等
+type Backend interface {
+	// 返回这个服务控制的账户列表，默认账户未打开
+	Wallets() []Wallet
+
+	// 注册生成钱包的异步时间
+	Subscribe(sink chan<- WalletEvent) event.Subscription
+}
+```
+
+### 4. P2P服务器初始化
 
 ```go
-// 创建P2P服务器实例
-node.server = p2p.NewServer(node.config.P2P)
+	// 创建P2P服务器实例
+	node.server = p2p.NewServer(node.config.P2P)
 // 这里配置 P2P 服务器节点的 NodeKey 和 Name，如果参数没有指定的话会自动生成一个
 	node.server.Config.PrivateKey = node.config.NodeKey()
 	node.server.Config.Name = node.config.NodeName()
@@ -193,15 +319,14 @@ type Config struct {
 }
 ```
 
-P2P 服务配置结构：
+P2P 服务配置结构(TODO 后面这个也需要专题细化)：
 ```go
 // p2p/server.go
 type Config struct {
-	// This field must be set to a valid secp256k1 private key.
+	// 节点 secp256k1 私钥
 	PrivateKey *ecdsa.PrivateKey `toml:"-"`
 
-	// MaxPeers is the maximum number of peers that can be
-	// connected. It must be greater than zero.
+	// 最多支持多少个对端节点
 	MaxPeers int
     // ...
 }
@@ -220,7 +345,7 @@ Node通过Register()方法注册各种服务：
 	// eth也满足生命周期管理接口，也需要注册
 	stack.RegisterLifecycle(eth)
 ```
-
+### 1. RPC API注册
 在makeFullNode()中，通过utils.RegisterEthService()等函数注册各种服务：
 
 ```go
@@ -236,11 +361,141 @@ func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (ethapi.Backend
 }
 ```
 
-## RPC服务初始化
+注册API服务接口逻辑比较简单，和前面的 注册内置rpcAPIs 逻辑一样，都是添加到node对象的rpcAPIs列表中：
+```go
+// RegisterAPIs registers the APIs a service provides on the node.
+func (n *Node) RegisterAPIs(apis []rpc.API) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
 
-Node还负责初始化各种RPC服务：
+	if n.state != initializingState {
+		panic("can't register APIs on running/stopped node")
+	}
+	n.rpcAPIs = append(n.rpcAPIs, apis...)
+}
+```
 
-###  初始化 RPC 服务
+上面分别注册了eth.APIs()和tracers.APIs(backend.APIBackend)，这里没必要列出注册了哪些具体的接口，大致看一下名称空间就行，具体的方法列表可以到代码里去看：
+```go
+func (s *Ethereum) APIs() []rpc.API {
+	apis := ethapi.GetAPIs(s.APIBackend)
+	apis = append(apis, s.engine.APIs(s.BlockChain())...)
+	return append(apis, []rpc.API{
+		{
+			Namespace: "eth",
+			Service:   NewEthereumAPI(s),
+		}, {
+			Namespace: "miner",
+			Service:   NewMinerAPI(s),
+		}, {
+			Namespace: "eth",
+			Service:   downloader.NewDownloaderAPI(s.handler.downloader, s.blockchain, s.eventMux),
+		}, {
+			Namespace: "admin",
+			Service:   NewAdminAPI(s),
+		}, {
+			Namespace: "debug",
+			Service:   NewDebugAPI(s),
+		}, {
+			Namespace: "net",
+			Service:   s.netRPCService,
+		},
+	}...)
+}
+```
+### 2. Protocols协议注册
+
+支持注册实现了p2p.Protocol接口的各种协议版本实现
+
+```go
+// RegisterProtocols adds backend's protocols to the node's p2p server.
+func (n *Node) RegisterProtocols(protocols []p2p.Protocol) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+
+	// 必须是在node初始化的时候进行注册，启动之后就不行了
+	if n.state != initializingState {
+		panic("can't register protocols on running/stopped node")
+	}
+	n.server.Protocols = append(n.server.Protocols, protocols...)
+}
+```
+
+### 3. Lifecycle生命周期注册
+
+支持注册实现了Lifecycle接口的各种服务，这个接口的逻辑比较简单，就两个接口方法Start/Stop，用于Node统一管理所有附加的服务：
+
+```go
+// RegisterLifecycle registers the given Lifecycle on the node.
+func (n *Node) RegisterLifecycle(lifecycle Lifecycle) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+
+	// 这个也是只能在初始化的时候注册，启动后就不行
+	if n.state != initializingState {
+		panic("can't register lifecycle on running/stopped node")
+	}
+	// 而且同一个生命周期实例，只允许注册一次，不允许重复（主要是避免状态混乱，如多次启动）
+	if containsLifecycle(n.lifecycles, lifecycle) {
+		panic(fmt.Sprintf("attempt to register lifecycle %T more than once", lifecycle))
+	}
+	n.lifecycles = append(n.lifecycles, lifecycle)
+}
+```
+
+## 启动Node服务
+通过node.Start()启动Node服务，它会带动一系列的服务启动：
+
+```go
+// 启动node服务，会启动上面注册的一些列的lifecycles, RPC services 和 p2p protocols
+// 注意！node生命周期内只允许启动一次
+func (n *Node) Start() error {
+	// 启停锁控制
+	n.startStopLock.Lock()
+	defer n.startStopLock.Unlock()
+
+	// 通用锁控制（避免和node内的其它逻辑并发）和node生命周期状态检查
+	n.lock.Lock()
+	switch n.state {
+	case runningState:
+		n.lock.Unlock()
+		return ErrNodeRunning
+	case closedState:
+		n.lock.Unlock()
+		return ErrNodeStopped
+	}
+	n.state = runningState
+
+	// 1. 启动当前节点的p2p服务、RPC服务
+	err := n.openEndpoints()
+	lifecycles := make([]Lifecycle, len(n.lifecycles))
+	copy(lifecycles, n.lifecycles)
+	n.lock.Unlock()
+
+	if err != nil {
+		n.doClose(nil)
+		return err
+	}
+
+	// 2. 启动所有注册的生命周期 lifecycles.
+	var started []Lifecycle
+	for _, lifecycle := range lifecycles {
+		if err = lifecycle.Start(); err != nil {
+			break
+		}
+		started = append(started, lifecycle)
+	}
+	// 如果有任何启动错误，终止node启动（当期节点启动失败）
+	if err != nil {
+		n.stopServices(started)
+		n.doClose(nil)
+	}
+	return err
+}
+```
+
+###  1. 启动RPC 服务
+> 这里只简单说明RPC服务启动，p2p的先不介绍了，后面的p2p专题再介绍（TODO）。
 
 ```go
 // node/node.go
@@ -315,7 +570,14 @@ func (n *Node) startRPC() error {
 }
 ```
 
+### 2. 启动生命周期 Lifecycle
+
+这个逻辑超简单，不用附代码了，就是循环调用各个Lifecycle对象的Start()方法即可，出错就返回。
+
+
 ## Node状态管理
+
+Node的生命周期比较简单，只有三个状态，默认就是初始化状态，就是对象创建到各种配置、注册的阶段，然后就是启动，成功就进入运行状态，失败就结束。
 
 Node使用状态机来管理其生命周期：
 
@@ -348,3 +610,6 @@ Node作为Geth的核心容器，承担着以下重要职责：
 5. **状态协调** - 通过状态机协调各组件的状态
 
 Node的设计体现了良好的模块化思想，将复杂的区块链节点功能分解为多个相对独立的服务，通过统一的容器进行管理，提高了代码的可维护性和可扩展性。
+
+> 注：涉及到的东西太多了，一不小心就深入了另一个模块，只能加了TODO，这样就欠了一屁股债，后面慢慢还吧。我感觉文章后面还得回过头来再返工修改，好像条理还不是很清晰。
+> 
