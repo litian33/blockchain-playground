@@ -1,19 +1,20 @@
 # Geth启动流程解析 - 第五篇：节点启动与服务运行
 
-## 引言
+## 1. 引言
 
 在完成了Node和Ethereum等核心服务的创建之后，Geth需要启动这些服务使其开始工作。本文将深入分析Geth如何启动节点以及各个服务是如何运行的。
 
-## 节点启动流程
+## 2. 节点启动流程
 
 节点启动的入口函数：
 
 ```go
+// cmd/geth/main.go
 func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isConsole bool) {
-	// 启动 Node
+	// 1. 启动 Node
 	utils.StartNode(ctx, stack, isConsole)
 
-	// 解锁账户
+	// 2. 解锁账户
 	unlockAccounts(ctx, stack)
 
 	// 注册钱包事件
@@ -25,41 +26,38 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 	ethClient := ethclient.NewClient(rpcClient)
 
 	go func() {
-		// 打开所有钱包
+		// 打开所有注册的钱包
 		for _, wallet := range stack.AccountManager().Wallets() {
 			if err := wallet.Open(""); err != nil {
 				log.Warn("Failed to open wallet", "url", wallet.URL(), "err", err)
 			}
 		}
-		// Listen for wallet event till termination
+		// 监听所有钱包事件，直到服务终止
 		for event := range events {
-			switch event.Kind {
-			case accounts.WalletArrived:
-				if err := event.Wallet.Open(""); err != nil {
-					log.Warn("New wallet appeared, failed to open", "url", event.Wallet.URL(), "err", err)
-				}
-			case accounts.WalletOpened:
-				status, _ := event.Wallet.Status()
-				log.Info("New wallet appeared", "url", event.Wallet.URL(), "status", status)
-
-				var derivationPaths []accounts.DerivationPath
-				if event.Wallet.URL().Scheme == "ledger" {
-					derivationPaths = append(derivationPaths, accounts.LegacyLedgerBaseDerivationPath)
-				}
-				derivationPaths = append(derivationPaths, accounts.DefaultBaseDerivationPath)
-
-				event.Wallet.SelfDerive(derivationPaths, ethClient)
-
-			case accounts.WalletDropped:
-				log.Info("Old wallet dropped", "url", event.Wallet.URL())
-				event.Wallet.Close()
-			}
+			// 这里响应钱包事件
+			// 新钱包：尝试打开目标钱包
+			// 钱包打开：获取目标钱包状态，生成钱包派生路径（leger硬件钱包和其它钱包不同），调用SelfDerive进行自动账户发现
+			// 钱包丢弃：关闭目标钱包
+			// ...
 		}
 	}()
 
-	// Start auxiliary services if enabled
+	// Spawn a standalone goroutine for status synchronization monitoring,
+	// close the node when synchronization is complete if user required.
+	// 生成一个独立的goroutine，用来监控同步进度，当同步完成后退出服务（配置ExitWhenSyncedFlag参数时）
+	if ctx.Bool(utils.ExitWhenSyncedFlag.Name) {
+		go func() {
+			// 这里是通过订阅node对象的downloader.DoneEvent事件实现的，
+			// 接收到这个事件时候，会调用node.Close()结束节点服务
+			sub := stack.EventMux().Subscribe(downloader.DoneEvent{})
+			defer sub.Unsubscribe()
+			// ...
+		}()
+	}
+
+	// 在矿工模式下启动挖矿服务
 	if ctx.Bool(utils.MiningEnabledFlag.Name) {
-		// Mining only makes sense if a full Ethereum node is running
+		// 矿工模式不支持轻节点
 		if ctx.String(utils.SyncModeFlag.Name) == "light" {
 			utils.Fatalf("Light clients do not support mining")
 		}
@@ -67,8 +65,7 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 		if !ok {
 			utils.Fatalf("Ethereum service not running")
 		}
-		// 矿工节点使用矿工费作为txpool的门限值，不接收低于矿工费的交易
-		// Set the gas price to the limits from the CLI and start mining
+		// 矿工节点使用矿工费作为txpool的门限值，不接收低于矿工费要求的交易
 		gasprice := flags.GlobalBig(ctx, utils.MinerGasPriceFlag.Name)
 		ethBackend.TxPool().SetGasTip(gasprice)
 
@@ -80,288 +77,138 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 }
 ```
 
-## Node.Start()详解
+## 3. Node.Start()详解
 
 stack.Start()是启动过程的核心：
 
 ```go
-func (n *Node) Start() error {
-	n.startStopLock.Lock()
-	defer n.startStopLock.Unlock()
-
-	n.stateLock.Lock()
-	switch n.state {
-	case stateOpening, stateStarted, stateClosed:
-		n.stateLock.Unlock()
-		return ErrNodeRunning
-	}
-	n.state = stateOpening
-	n.stateLock.Unlock()
-	
-	// 启动所有注册的服务
-	if err := n.startServices(); err != nil {
-		n.doClose(nil)
-		return err
-	}
-	
-	// 启动P2P服务器
-	if err := n.server.Start(); err != nil {
-		n.doClose(nil)
-		return err
-	}
-	
-	// 启动RPC服务
-	if err := n.startRPC(); err != nil {
-		n.doClose(nil)
-		return err
-	}
-	
-	// 标记为已启动
-	n.stateLock.Lock()
-	n.state = stateStarted
-	n.stateLock.Unlock()
-	
-	return nil
-}
+	// 1. 启动 Node
+	utils.StartNode(ctx, stack, isConsole)
 ```
 
-### 1. 启动注册的服务
+它不是单纯的直接调用node的Start方法，而是包装了一层逻辑在外面，如下：
 
 ```go
-func (n *Node) startServices() error {
-	// 实例化所有已注册的服务
-	for _, constructor := range n.serviceFuncs {
-		// 调用服务构造函数
-		ctx := &ServiceContext{
-			Config:         *n.config,
-			Services:       make(map[reflect.Type]Service),
-			EventMux:       n.eventmux,
-			AccountManager: n.accman,
-		}
-		// 复制已创建的服务到context中
-		for kind, s := range n.services {
-			ctx.Services[kind] = s
-		}
-		
-		// 创建新服务
-		service, err := constructor(ctx)
-		if err != nil {
-			return err
-		}
-		
-		// 获取服务类型
-		kind := reflect.TypeOf(service)
-		if _, exists := n.services[kind]; exists {
-			return &DuplicateServiceError{Kind: kind}
-		}
-		
-		// 保存服务实例
-		n.services[kind] = service
+// cmd/utils/cmd.go
+func StartNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
+	// 这里是调用node的Start方法
+	if err := stack.Start(); err != nil {
+		Fatalf("Error starting protocol stack: %v", err)
 	}
-	
-	// 启动各个服务
-	for _, service := range n.services {
-		// 启动服务
-		if err := service.Start(); err != nil {
-			return err
+	// 下面是启动了一个go协程，实现优雅退出和可用磁盘监控
+	go func() {
+		sigc := make(chan os.Signal, 1)
+		signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigc)
+
+		// 计算最小可接受的空闲磁盘空间
+		minFreeDiskSpace := 2 * ethconfig.Defaults.TrieDirtyCache // Default 2 * 256Mb
+		if ctx.IsSet(MinFreeDiskSpaceFlag.Name) {
+			minFreeDiskSpace = ctx.Int(MinFreeDiskSpaceFlag.Name)
+		} else if ctx.IsSet(CacheFlag.Name) || ctx.IsSet(CacheGCFlag.Name) {
+			minFreeDiskSpace = 2 * ctx.Int(CacheFlag.Name) * ctx.Int(CacheGCFlag.Name) / 100
 		}
-	}
-	
-	return nil
+		// 这里启动单独的可用磁盘空间监控
+		if minFreeDiskSpace > 0 {
+			// 详细代码不放上了，就是监测到磁盘不足，使用退出信号强制退出，避免数据损坏
+			// sigc <- syscall.SIGTERM
+			go monitorFreeDiskSpace(sigc, stack.InstanceDir(), uint64(minFreeDiskSpace)*1024*1024)
+		}
+
+		// 这里定义了优雅退出函数
+		shutdown := func() {
+			log.Info("Got interrupt, shutting down...")
+			go stack.Close()
+			for i := 10; i > 0; i-- {
+				<-sigc
+				if i > 1 {
+					log.Warn("Already shutting down, interrupt more to panic.", "times", i-1)
+				}
+			}
+			debug.Exit() // 退出是强制刷新trace信息和CPU优化信息
+			debug.LoudPanic("boom")
+		}
+
+		if isConsole {
+			// 这里接收控制台模式下的退出信号SIGTERM 
+			for {
+				sig := <-sigc
+				if sig == syscall.SIGTERM {
+					shutdown()
+					return
+				}
+			}
+		} else {
+			// 接收退出信号（SIGINT或SIGTERM ），执行优雅退出
+			<-sigc
+			shutdown()
+		}
+	}()
 }
 ```
 
-对于Ethereum服务，其方法实现如下：
+至于node.Start()的详细逻辑，在本系列文章的 Geth启动流程解析 - 第三篇：Node节点创建与初始化 有介绍，可以参考，这里不再赘述。
 
-```go
-func (s *Ethereum) Start() error {
-	// 启动布隆过滤器处理
-	s.startBloomHandlers(params.BloomBitsBlocks)
-	
-	// 启动协议管理器
-	if s.protocolManager != nil {
-		s.protocolManager.Start()
-	}
-	
-	// 启动下载器
-	if s.downloader != nil {
-		s.downloader.Start()
-	}
-	
-	// 启动交易池
-	s.txPool.Start()
-	
-	// 启动矿工
-	s.miner.Start()
-	
-	// 启动自动挖矿（如果配置）
-	if s.config.Miner.StartAutomatically {
-		s.StartMining()
-	}
-	
-	return nil
-}
-```
-
-### 2. 启动P2P服务器
-
-```go
-if err := n.server.Start(); err != nil {
-	n.doClose(nil)
-	return err
-}
-```
-
-P2P服务器的启动包括：
-
-1. 启动网络监听
-2. 启动节点发现机制
-3. 启动各种网络协议处理器
-
-### 3. 启动RPC服务
-
-```go
-func (n *Node) startRPC() error {
-	// 收集所有API
-	apis := n.apis()
-	
-	// 启动各种RPC服务
-	if err := n.startInProc(apis); err != nil {
-		return err
-	}
-	
-	if err := n.startIPC(apis); err != nil {
-		n.stopInProc()
-		return err
-	}
-	
-	if err := n.startHTTP(n.httpEndpoint, apis, n.httpModules, n.httpCors, n.httpVhosts, n.httpTimeouts); err != nil {
-		n.stopIPC()
-		n.stopInProc()
-		return err
-	}
-	
-	if err := n.startWS(n.wsEndpoint, apis, n.wsModules, n.wsOrigins, n.wsExposeAll); err != nil {
-		n.stopHTTP()
-		n.stopIPC()
-		n.stopInProc()
-		return err
-	}
-	
-	return nil
-}
-```
-
-## 账户解锁
+## 4. 账户解锁
 
 如果配置了自动解锁账户，会执行以下操作：
 
 ```go
 func unlockAccounts(ctx *cli.Context, stack *node.Node) {
-	// 获取账户管理器
-	am := stack.AccountManager()
-	
-	// 获取要解锁的账户
-	passwords := utils.MakePasswordList(ctx)
-	unlocks := strings.Split(ctx.GlobalString(utils.UnlockedAccountFlag.Name), ",")
-	for i, account := range unlocks {
-		if trimmed := strings.TrimSpace(account); trimmed != "" {
-			// 解锁账户
-			unlockAccount(ctx, am, trimmed, i, passwords)
+	// 获取命令行参数--unlock指定的需要自动解锁的地址列表
+	var unlocks []string
+	inputs := strings.Split(ctx.String(utils.UnlockedAccountFlag.Name), ",")
+	for _, input := range inputs {
+		if trimmed := strings.TrimSpace(input); trimmed != "" {
+			unlocks = append(unlocks, trimmed)
 		}
 	}
-}
-```
-
-## 挖矿启动
-
-如果配置了自动挖矿，会启动挖矿服务：
-
-```go
-func startMining(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
-	// 检查是否配置了挖矿
-	if !ctx.GlobalIsSet(utils.MiningEnabledFlag.Name) {
+	// 没指定就直接返回
+	if len(unlocks) == 0 {
 		return
 	}
-	
-	// 启动挖矿
-	if err := backend.StartMining(ctx.GlobalInt(utils.MinerThreadsFlag.Name)); err != nil {
-		Fatalf("Failed to start mining: %v", err)
+
+	// 检查命令行allow-insecure-unlock参数和rpc是否同时启用（禁止同时启用，有安全风险）
+	if !stack.Config().InsecureUnlockAllowed && stack.Config().ExtRPCEnabled() {
+		utils.Fatalf("Account unlock with HTTP access is forbidden!")
+	}
+	backends := stack.AccountManager().Backends(keystore.KeyStoreType)
+	if len(backends) == 0 {
+		log.Warn("Failed to unlock accounts, keystore is not available")
+		return
+	}
+	ks := backends[0].(*keystore.KeyStore)
+	// 这行代码会从命令行参数--password指定的密码文件中读取钱包文件的解密密码（可能会有多行，和要解锁的地址顺序对应）
+	passwords := utils.MakePasswordList(ctx)
+	for i, account := range unlocks {
+		// 解锁钱包账户
+		unlockAccount(ks, account, i, passwords)
 	}
 }
 ```
 
-在Ethereum服务中，StartMining()方法实现如下：
+## 5.挖矿启动
 
-```go
-func (s *Ethereum) StartMining(threads int) error {
-	// 设置挖矿线程数
-	if threads == 0 {
-		threads = runtime.NumCPU()
-	}
-	
-	// 配置挖矿参数
-	s.miner.SetThreads(threads)
-	
-	// 设置etherbase
-	eb, err := s.Etherbase()
-	if err != nil {
-		return err
-	}
-	s.miner.SetEtherbase(eb)
-	
-	// 启动挖矿
-	s.miner.Start()
-	return nil
-}
-```
+本系列文章就不深入挖矿机制了，只需要直到这里会开始启动挖矿进程（和交易池、共识配合打包出块），后面会有专题分析（TODO）。
 
-## 服务运行机制
 
-### 区块链同步
+## 6. 服务运行机制
 
-Ethereum服务启动后，会通过协议管理器进行区块同步：
+这里也不深入介绍，运行过程中涉及到多个功能模块的配合，这里简单理出服务运行过程中的主要内容：
 
-```go
-// 在ProtocolManager.Start()中
-go pm.syncer()
-go pm.txsyncLoop()
-```
+- P2P会进行区块的同步和交易的广播；
+- TxPool管理内存中的交易；
+- RPC接收外部交易请求和查询请求；
+- 矿工负责读取TxPool中的交易和共识一起打包出块；
 
-### 交易池运行
 
-交易池启动后会运行事件处理循环：
-
-```go
-// 在TxPool.Start()中
-go pool.scheduleReorgLoop()
-go pool.feedPendingLogs()
-```
-
-### 矿工运行
-
-矿工启动后会运行挖矿循环：
-
-```go
-// 在Miner.Start()中
-go miner.update()
-go worker.mainLoop()
-```
-
-## 等待中断信号
+## 7. 服务关闭
 
 最后，主函数调用stack.Wait()等待中断信号：
 
 ```go
+// Wait blocks until the node is closed.
 func (n *Node) Wait() {
-	n.stateLock.RLock()
-	if n.state != stateStarted {
-		n.stateLock.RUnlock()
-		return
-	}
-	n.stateLock.RUnlock()
-	
-	// 等待中断信号
 	<-n.stop
 }
 ```
@@ -369,37 +216,90 @@ func (n *Node) Wait() {
 当收到中断信号时，会执行关闭流程：
 
 ```go
+// 执行关闭操作
 func (n *Node) Close() error {
-	// 执行关闭操作
-	return n.doClose(nil)
+	n.startStopLock.Lock()
+	defer n.startStopLock.Unlock()
+
+	n.lock.Lock()
+	state := n.state
+	n.lock.Unlock()
+	switch state {
+	case initializingState:
+		// 这个是异常情况，未启动成功就关闭
+		return n.doClose(nil)
+	case runningState:
+		// 运行态关闭，正常情况，需要释放一些资源
+		var errs []error
+		// 停止node内部的多个服务
+		if err := n.stopServices(n.lifecycles); err != nil {
+			errs = append(errs, err)
+		}
+		return n.doClose(errs)
+	case closedState:
+		// 重复关闭，这里不应该进入
+		return ErrNodeStopped
+	default:
+		panic(fmt.Sprintf("node is in unknown state %d", state))
+	}
 }
 
-func (n *Node) doClose(errs []error) error {
-	// 停止所有服务
-	for _, service := range n.services {
-		service.Stop()
-	}
-	
-	// 停止P2P服务器
-	n.server.Stop()
-	
+func (n *Node) stopServices(running []Lifecycle) error {
 	// 停止RPC服务
-	n.stopWS()
-	n.stopHTTP()
-	n.stopIPC()
-	n.stopInProc()
-	
-	// 关闭数据库
-	if n.database != nil {
-		n.database.Close()
+	n.stopRPC()
+
+	// 停止多个Lifecycle生命周期
+	failure := &StopError{Services: make(map[reflect.Type]error)}
+	for i := len(running) - 1; i >= 0; i-- {
+		if err := running[i].Stop(); err != nil {
+			failure.Services[reflect.TypeOf(running[i])] = err
+		}
 	}
-	
-	// 更新状态
-	n.stateLock.Lock()
-	n.state = stateClosed
-	n.stateLock.Unlock()
-	
+
+	// 停止P2P服务
+	n.server.Stop()
+
+	if len(failure.Services) > 0 {
+		return failure
+	}
 	return nil
+}
+
+// 然后是最终收尾
+func (n *Node) doClose(errs []error) error {
+	// 关闭数据库，需要获取锁进行操作（和OpenDatabase*互斥）
+	n.lock.Lock()
+	n.state = closedState
+	// 这里执行真正的数据库Close逻辑
+	errs = append(errs, n.closeDatabases()...)
+	n.lock.Unlock()
+
+	// 关闭账户管理器
+	if err := n.accman.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	// 删除临时的keystore目录
+	if n.keyDirTemp {
+		if err := os.RemoveAll(n.keyDir); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// 释放datadir目录锁
+	n.closeDataDir()
+
+	// 释放n.Wait锁
+	close(n.stop)
+
+	// 检查错误信息
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	default:
+		return fmt.Errorf("%v", errs)
+	}
 }
 ```
 
@@ -415,3 +315,5 @@ Geth节点启动过程按以下顺序进行：
 6. **等待运行** - 等待中断信号保持运行状态
 
 这个启动流程确保了各个组件按照正确的依赖关系依次启动，形成了一个完整运行的以太坊节点。每个组件都有自己的生命周期管理，使得整个系统具有良好的可维护性和可扩展性。
+
+本系列暂时草草收尾，感觉写的很乱，改天再重新整理一下。
