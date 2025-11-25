@@ -1,10 +1,10 @@
 # Geth启动流程解析 - 第三篇：Node节点创建与初始化
 
-## 引言
+## 1.引言
 
 Node是以太坊节点的核心容器，负责管理各种服务的生命周期。在Geth启动过程中，创建和初始化Node实例是非常关键的一步。本文将深入分析Node的创建过程及其内部机制。
 
-## Node结构分析
+## 2.Node结构分析
 
 Node结构体是Geth中最重要的容器组件：
 
@@ -45,10 +45,14 @@ type Node struct {
 }
 ```
 
-## Node创建过程
+## 3.Node创建过程
 
-Node的创建主要通过New函数完成：
+Node的创建主要通过New函数完成，触发点在[这里](geth启动流程解析01#241-makeconfignode---创建基础配置)，调用一下代码创建节点：
+```go
+stack, err := node.New(&cfg.Node)
+```
 
+具体对象创建逻辑如下：
 ```go
 // node/node.go
 // 创建一个P2P 节点, 支持协议注册
@@ -87,7 +91,8 @@ func New(conf *Config) (*Node, error) {
 	// BatchRequestLimit:    1000,
 	// BatchResponseMaxSize: 25 * 1000 * 1000,
 	server.SetBatchLimits(conf.BatchRequestLimit, conf.BatchResponseMaxSize)
-	// 创建node实例对象
+
+	// 这里组装创建node实例对象
 	node := &Node{
 		config:        conf,
 		inprocHandler: server,
@@ -122,6 +127,7 @@ func New(conf *Config) (*Node, error) {
 	node.server.Config.PrivateKey = node.config.NodeKey()
 	node.server.Config.Name = node.config.NodeName()
 	node.server.Config.Logger = node.log
+
 	// 检查历史无效的配置文件（如datadir下的static-nodes.json，新版本已经失效，需要从配置文件的P2P.StaticNodes中读取）
 	node.config.checkLegacyFiles()
 	// 配置节点数据库（用来存储发现的P2P节点信息）
@@ -139,7 +145,8 @@ func New(conf *Config) (*Node, error) {
 	return node, nil
 }
 ```
-### 1. 内置rpcAPIs - RPC服务注册
+
+### 3.1. 内置rpcAPIs - RPC服务注册
 
 ```go
 // node/api.go
@@ -208,7 +215,7 @@ func (n *Node) apis() []rpc.API {
 这些方法提供了节点管理、调试工具和 Web3 实用程序的功能。
 
 
-### 2. openDataDir() - 数据目录初始化
+### 3.2. openDataDir() - 数据目录初始化
 
 ```go
 func (n *Node) openDataDir() error {
@@ -233,7 +240,9 @@ func (n *Node) openDataDir() error {
 }
 ```
 
-### 3. accounts.NewManager() - 账户管理器初始化
+需要注意，这里的openDataDir就如字面含义，只是对目录加锁，并没有数据操作。
+
+### 3.3. accounts.NewManager() - 账户管理器初始化
 
 ```go
 // accounts/manager.go
@@ -291,17 +300,20 @@ type Backend interface {
 }
 ```
 
-### 4. P2P服务器初始化
+### 3.4. P2P服务器初始化
 
 ```go
 	// 创建P2P服务器实例
 	node.server = p2p.NewServer(node.config.P2P)
-// 这里配置 P2P 服务器节点的 NodeKey 和 Name，如果参数没有指定的话会自动生成一个
+
+	// 这里配置 P2P 服务器节点的 NodeKey 和 Name，如果参数没有指定的话会自动生成一个
 	node.server.Config.PrivateKey = node.config.NodeKey()
 	node.server.Config.Name = node.config.NodeName()
 	node.server.Config.Logger = node.log
+
     // 这里会检测是否有旧版本的配置文件 static-nodes.json 和 trusted-nodes.json，新版本中已经不允许使用，即使存在也不会生效
 	node.config.checkLegacyFiles()
+
     // 如果没有指定数据库目录，则使用默认的nodes 目录存储p2p 节点信息
 	if node.server.Config.NodeDatabase == "" {
 		node.server.Config.NodeDatabase = node.config.NodeDB()
@@ -332,7 +344,7 @@ type Config struct {
 }
 ```
 
-## 服务注册机制
+## 4.服务注册机制
 
 Node通过Register()方法注册各种服务：
 
@@ -345,12 +357,15 @@ Node通过Register()方法注册各种服务：
 	// eth也满足生命周期管理接口，也需要注册
 	stack.RegisterLifecycle(eth)
 ```
-### 1. RPC API注册
+
+### 4.1. RPC API注册
 在makeFullNode()中，通过utils.RegisterEthService()等函数注册各种服务：
 
 ```go
 // 注册Ethereum client到节点中
+// cmd/utils/flags.go
 func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (ethapi.Backend, *eth.Ethereum) {
+	// 后面的注册API都是附加动作，主要是这里的创建了Ethereum服务，并关联了node对象，它才是最终服务的提供者
 	backend, err := eth.New(stack, cfg)
 	if err != nil {
 		Fatalf("Failed to register the Ethereum service: %v", err)
@@ -403,7 +418,7 @@ func (s *Ethereum) APIs() []rpc.API {
 	}...)
 }
 ```
-### 2. Protocols协议注册
+### 4.2. Protocols协议注册
 
 支持注册实现了p2p.Protocol接口的各种协议版本实现
 
@@ -421,7 +436,7 @@ func (n *Node) RegisterProtocols(protocols []p2p.Protocol) {
 }
 ```
 
-### 3. Lifecycle生命周期注册
+### 4.3. Lifecycle生命周期注册
 
 支持注册实现了Lifecycle接口的各种服务，这个接口的逻辑比较简单，就两个接口方法Start/Stop，用于Node统一管理所有附加的服务：
 
@@ -443,8 +458,92 @@ func (n *Node) RegisterLifecycle(lifecycle Lifecycle) {
 }
 ```
 
+### 4.4 Handler注册
 
-## Node状态管理
+```go
+	// 如这个http的handler
+	node.http = newHTTPServer(node.log, conf.HTTPTimeouts)
+```
+
+以这个出错为例子(来源于[makeFullNode中的各种服务注册](geth启动流程解析01.md#24-makefullnode函数---创建完整节点))
+```go
+	// step1 这里调用注册工具函数
+	// cmd/geth/config.go
+	if ctx.IsSet(utils.GraphQLEnabledFlag.Name) {
+		utils.RegisterGraphQLService(stack, backend, filterSystem, &cfg.Node)
+	}
+```
+```go
+// step2 这里创建对应的服务对象
+// cmd/utils/flags.go
+func RegisterGraphQLService(stack *node.Node, backend ethapi.Backend, filterSystem *filters.FilterSystem, cfg *node.Config) {
+	err := graphql.New(stack, backend, filterSystem, cfg.GraphQLCors, cfg.GraphQLVirtualHosts)
+	if err != nil {
+		Fatalf("Failed to register the GraphQL service: %v", err)
+	}
+}
+```
+
+```go
+// graphql/service.go
+
+// step3 创建服务对象时，创建Handler
+func New(stack *node.Node, backend ethapi.Backend, filterSystem *filters.FilterSystem, cors, vhosts []string) error {
+	_, err := newHandler(stack, backend, filterSystem, cors, vhosts)
+	return err
+}
+
+// step4 注册到node的handler服务中
+// 这里创建了一个新的 `http.Handler` 可以响应 GraphQL 查询
+// 它还想node节点注册了请求路基
+func newHandler(stack *node.Node, backend ethapi.Backend, filterSystem *filters.FilterSystem, cors, vhosts []string) (*handler, error) {
+	q := Resolver{backend, filterSystem}
+
+	s, err := graphql.ParseSchema(schema, &q)
+	if err != nil {
+		return nil, err
+	}
+	h := handler{Schema: s}
+	handler := node.NewHTTPHandlerStack(h, cors, vhosts, nil)
+
+	stack.RegisterHandler("GraphQL UI", "/graphql/ui", GraphiQL{})
+	stack.RegisterHandler("GraphQL UI", "/graphql/ui/", GraphiQL{})
+
+	// 可以通过这两个请求路径访问GraphQL服务
+	stack.RegisterHandler("GraphQL", "/graphql", handler)
+	stack.RegisterHandler("GraphQL", "/graphql/", handler)
+
+	return &h, nil
+}
+```
+
+```go
+// node/node.go
+// step5 node内部的注册方法，支持各种服务路径注册
+func (n *Node) RegisterHandler(name, path string, handler http.Handler) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+
+	if n.state != initializingState {
+		panic("can't register HTTP handler on running/stopped node")
+	}
+
+	n.http.mux.Handle(path, handler)
+	n.http.handlerNames[path] = name
+}
+```
+上面一整条Handler注册路径就是（典型服务，类似GraphQL的还有其他服务）：
+
+```mermaid
+flowchart TD
+    A[开始] --> B[调用工具函数];
+    B --> C[创建对应服务对象];
+    C --> D[创建服务Handler];
+    D --> E[向Node注册Handler];
+    E --> F[响应Node路由过来的请求];
+```
+
+## 5.Node状态管理
 
 Node的生命周期比较简单，只有三个状态，默认就是初始化状态，就是对象创建到各种配置、注册的阶段，然后就是启动，成功就进入运行状态，失败就结束。
 
@@ -468,7 +567,7 @@ stateDiagram
     runningState --> closedState : Close()
 ```
 
-## 总结
+## 6.总结
 
 Node作为Geth的核心容器，承担着以下重要职责：
 
@@ -480,5 +579,5 @@ Node作为Geth的核心容器，承担着以下重要职责：
 
 Node的设计体现了良好的模块化思想，将复杂的区块链节点功能分解为多个相对独立的服务，通过统一的容器进行管理，提高了代码的可维护性和可扩展性。
 
-> 注：涉及到的东西太多了，一不小心就深入了另一个模块，只能加了TODO，这样就欠了一屁股债，后面慢慢还吧。我感觉文章后面还得回过头来再返工修改，好像条理还不是很清晰。
+> 注：涉及到的东西太多了，一不小心就深入了另一个模块，只能加了TODO，这样就欠了一屁股债，后面慢慢还吧。
 > 
