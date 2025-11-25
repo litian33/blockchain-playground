@@ -1,10 +1,10 @@
 # Geth启动流程解析 - 第二篇：配置系统详解
 
-## 引言
+## 1.引言
 
 Geth的配置系统是其灵活性和可扩展性的基础。通过丰富的命令行参数和配置选项，用户可以根据自己的需求定制节点行为。本文将深入分析Geth配置系统的实现机制。
 
-## 配置系统结构
+## 2.配置系统结构
 
 Geth的配置系统主要由以下几个部分组成：
 
@@ -13,7 +13,7 @@ Geth的配置系统主要由以下几个部分组成：
 3. **配置加载** - 从命令行参数、配置文件等来源加载配置
 4. **配置应用** - 将配置应用到各个组件
 
-## 命令行参数定义
+## 3.命令行参数定义
 
 Geth使用urfave/cli库来处理命令行参数。所有可用的命令行参数都在不同的文件中定义，例如：
 
@@ -46,7 +46,7 @@ var (
 ```
 
 
-这些flag在main.go中按照各自分类添加到xxxFlags变量中：
+这些flag在main.go中按照各自分类添加到xxxFlags分组中：
 
 ```go
 	// 节点相关的参数
@@ -81,7 +81,7 @@ var (
 	)
 	flags.AutoEnvVars(app.Flags, "GETH")
 ```
-## 配置结构体
+## 4.配置结构体
 
 Geth使用嵌套的结构体来组织配置：
 
@@ -102,7 +102,7 @@ type gethConfig struct {
 
 其中最主要的两个配置是ethconfig.Config和node.Config：
 
-### 1. ethconfig.Config - 以太坊协议配置
+### 4.1. ethconfig.Config - 以太坊协议配置
 
 也就是和以太坊相关的配置，如网络ID、同步模式、数据库选项、交易池配置、Gas价格预言机配置、挖矿配置等等。
 ```go
@@ -296,13 +296,13 @@ type Config struct {
 ```
 
 
-## 配置加载过程
+## 5.配置加载过程
 
-配置加载主要在makeConfigNode()函数中完成，这个函数的主体逻辑参考[4.1 makeConfigNode() - 创建基础配置](geth启动流程解析01.md#41-makeconfignode----创建基础配置)
+配置加载主要在makeConfigNode()函数中完成，这个函数的主体逻辑参考[4.1 makeConfigNode() - 创建基础配置](geth启动流程解析01.md#241-makeconfignode---创建基础配置)
 
 下面针对逻辑中的部分细节内容进行说明
 
-### 1. 加载默认
+### 5.1. 加载默认
 
 ```go
 	cfg := gethConfig{
@@ -310,11 +310,22 @@ type Config struct {
 		Node:    defaultNodeConfig(),
 		Metrics: metrics.DefaultConfig,
 	}
+
+	// 加载配置文件并合并默认配置 (配置文件中的配置项会覆盖默认配置项)
+	if err := loadConfig(file, &cfg); err != nil {
+		utils.Fatalf("%v", err)
+	}
+
+	// 应用命令行标志，根据命令行参数更新 cfg 配置对象(下个小节展开)
+	utils.SetNodeConfig(ctx, &cfg.Node)	
 ```
-这里创建了一个默认的配置对象cfg，这个对象包含了Eth、Node和Metrics三个部分，都直设置了默认值。
+这里创建了一个默认的配置对象cfg，这个对象包含了Eth、Node和Metrics三个部分，都只设置了默认值。
+
+然后会读取配置文件中的内容，进行合并，同一个参数 配置文件优先级 > 默认值。
+
 这里没啥好分析的，直接进去看默认值就行了。
 
-### 2. SetNodeConfig() - 应用节点配置
+### 5.2. SetNodeConfig() - 应用节点配置
 
 将命令行参数应用到node.Config中
 ```go
@@ -356,9 +367,9 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 }
 ```
 
-上面一大SetXXX 其实没有包含复杂逻辑，主要实现的功能就是从 ctx 上下文中读取命令行参数的值，然后谁知道 cfg 对象对应的属性上，以后按需查看就行，不需要花费精力研究这块代码。
+上面一系列的setXXX 其实没有包含复杂逻辑，主要实现的功能就是从 ctx 上下文中读取命令行参数的值，然后设置到 cfg 对象对应的属性上，以后按需查看就行，不需要花费太多精力研究这块代码。
 
-### 3. SetEthConfig() - 应用以太坊配置
+### 5.3. SetEthConfig() - 应用以太坊配置
 
 ```go
 // cmd/utils/flags.go
@@ -395,12 +406,14 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 }
 ```
 
-## 服务注册
-在上一篇文章的[4.1 makeConfigNode() - 创建基础配置](geth启动流程解析01.md#4.makeFullNode()----创建完整节点) 章节，除了加载配置之外，还包含了一系列的 utils.RegisterXXX(stack, ...) 服务注册逻辑，这部分内容这里不展开，因为他们针对 Node 对象进行操作，下一篇文章会细化分析。
+这个方法和SetNodeConfig类似，也是设置一系列参数到cfg配置对象中，只是这里主要是以太坊服务相关的参数。
 
-## 配置验证
+## 6.服务注册
+在上一篇文章的[4.1 makeConfigNode() - 创建基础配置](geth启动流程解析01.md#4.makeFullNode()----创建完整节点) 章节，除了加载配置之外，还包含了一系列的 utils.RegisterXXX(stack, ...) 服务注册逻辑，这部分内容这里不展开，因为他们针对 Node 对象进行操作，[下一篇文章会细化分析](geth启动流程解析03.md)。
 
-Geth在多个地方对配置进行验证，确保配置的有效性和一致性：
+## 7.配置验证
+
+Geth在多个地方对配置进行验证，确保配置的有效性和一致性，这里其实隐藏有很多细节问题，但在这里也写不全，后面针对具体的参数进行分析（TODO 配置参数解析）：
 
 ```go
 // 在RegisterEthService中验证同步模式
@@ -415,7 +428,7 @@ if cfg.Miner.GasPrice == nil || cfg.Miner.GasPrice.Cmp(common.Big0) <= 0 {
 }
 ```
 
-## 总结
+## 8.总结
 
 Geth的配置系统具有以下特点：
 
