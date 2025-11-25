@@ -79,15 +79,16 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 
 ## 3. Node.Start()详解
 
-stack.Start()是启动过程的核心：
+### 3.1 磁盘监控和优雅退出
+
+它不是单纯的直接调用node的Start方法，而是包装了一层逻辑在外面，如下：
 
 ```go
 	// 1. 启动 Node
 	utils.StartNode(ctx, stack, isConsole)
 ```
 
-它不是单纯的直接调用node的Start方法，而是包装了一层逻辑在外面，如下：
-
+下面是具体逻辑：
 ```go
 // cmd/utils/cmd.go
 func StartNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
@@ -147,7 +148,138 @@ func StartNode(ctx *cli.Context, stack *node.Node, isConsole bool) {
 }
 ```
 
-至于node.Start()的详细逻辑，在本系列文章的 Geth启动流程解析 - 第三篇：Node节点创建与初始化 有介绍，可以参考，这里不再赘述。
+
+### 3.2 启动Node服务
+通过node.Start()启动Node服务，它会带动一系列的服务启动：
+
+```go
+// 启动node服务，会启动上面注册的一些列的lifecycles, RPC services 和 p2p protocols
+// 注意！node生命周期内只允许启动一次
+func (n *Node) Start() error {
+	// 启停锁控制
+	n.startStopLock.Lock()
+	defer n.startStopLock.Unlock()
+
+	// 通用锁控制（避免和node内的其它逻辑并发）和node生命周期状态检查
+	n.lock.Lock()
+	switch n.state {
+	case runningState:
+		n.lock.Unlock()
+		return ErrNodeRunning
+	case closedState:
+		n.lock.Unlock()
+		return ErrNodeStopped
+	}
+	n.state = runningState
+
+	// 1. 启动当前节点的p2p服务、RPC服务
+	err := n.openEndpoints()
+	lifecycles := make([]Lifecycle, len(n.lifecycles))
+	copy(lifecycles, n.lifecycles)
+	n.lock.Unlock()
+
+	if err != nil {
+		n.doClose(nil)
+		return err
+	}
+
+	// 2. 启动所有注册的生命周期 lifecycles.
+	var started []Lifecycle
+	for _, lifecycle := range lifecycles {
+		if err = lifecycle.Start(); err != nil {
+			break
+		}
+		started = append(started, lifecycle)
+	}
+	// 如果有任何启动错误，终止node启动（当期节点启动失败）
+	if err != nil {
+		n.stopServices(started)
+		n.doClose(nil)
+	}
+	return err
+}
+```
+
+###  3.2. 启动RPC 服务
+> 这里只简单说明RPC服务启动，p2p的先不介绍了，后面的p2p专题再介绍（TODO）。
+
+```go
+// node/node.go
+// 在启动时配置各种RPC endpoints
+func (n *Node) startRPC() error {
+	// 首先过滤掉 personal api，避免私钥暴露给外部
+	var apis []rpc.API
+	for _, api := range n.rpcAPIs {
+		if api.Namespace == "personal" {
+			if n.config.EnablePersonal {
+				log.Warn("Deprecated personal namespace activated")
+			} else {
+				continue
+			}
+		}
+		apis = append(apis, api)
+	}
+    // 启动进程内服务
+	if err := n.startInProc(apis); err != nil {
+		return err
+	}
+
+	// 配置并启动 IPC.
+	// ...
+
+    // 配置各种外部 RPC 服务
+	var (
+		servers           []*httpServer
+		openAPIs, allAPIs = n.getAPIs()
+	)
+
+	// 配置HTTP.
+    // ...
+
+    // 配置WS.
+    // ...
+
+    // 配置http 和 ws认证服务
+	// ...
+
+	// 配置公开的HTTP.
+	if n.config.HTTPHost != "" {
+		// Configure legacy unauthenticated HTTP.
+		if err := initHttp(n.http, n.config.HTTPPort); err != nil {
+			return err
+		}
+	}
+	// 配置公开的 WebSocket.
+	if n.config.WSHost != "" {
+		// legacy unauthenticated
+		if err := initWS(n.config.WSPort); err != nil {
+			return err
+		}
+	}
+	// 配置认证 API
+	if len(openAPIs) != len(allAPIs) {
+		jwtSecret, err := n.obtainJWTSecret(n.config.JWTSecret)
+		if err != nil {
+			return err
+		}
+		if err := initAuth(n.config.AuthPort, jwtSecret); err != nil {
+			return err
+		}
+	}
+	// 启动上面配置的各种 RPC 服务
+	for _, server := range servers {
+		if err := server.start(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+```
+
+### 3.3. 启动生命周期 Lifecycle
+
+这个逻辑超简单，不用附代码了，就是循环调用各个Lifecycle对象的Start()方法即可，出错就返回。
+
 
 ## 4. 账户解锁
 

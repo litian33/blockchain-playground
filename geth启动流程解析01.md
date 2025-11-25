@@ -1,10 +1,10 @@
 # Geth启动流程解析
 
-## 引言
+## 1.引言
 
 Geth是以太坊官方的Go语言实现，是接入以太坊网络的重要工具。了解其启动流程有助于我们深入理解以太坊的内部工作机制。本文将详细分析Geth的启动流程及各个环节的实际工作内容。本地代码中做了一些注解，但是看起来不够系统，所以整理成文档，给自己留一个笔记。以后忘记时也能回头参考。
 
-## 启动主流程
+## 2.启动主流程
 
 Geth启动入口及几个主要方法：
 
@@ -19,7 +19,7 @@ graph TD
     D --> H["stack.Wait()"]
 ```
 
-### 1. 程序入口
+### 2.1. 程序入口
 
 Geth的程序入口在`cmd/geth/main.go`文件中
 
@@ -99,7 +99,7 @@ func main() {
 }
 ```
 
-### 2. 启动主函数geth()
+### 2.2. 启动主函数geth()
 
 当没有指定子命令时，默认会执行geth()函数：
 
@@ -123,7 +123,7 @@ func geth(ctx *cli.Context) error {
 
 下面我们逐一分析这几个关键步骤。
 
-### 3. prepare()函数
+### 2.3. prepare()函数
 
 prepare函数不包含什么复杂的逻辑，主要就是一些前置条件检查，各种参数检查，下面增加注释的代码：
 
@@ -156,7 +156,7 @@ func prepare(ctx *cli.Context) {
 > 注意，这个方法并没有返回值，但是它直接修改了cli.Context对象内的取值(其实只修改了 cache 缓存参数)，会影响后续逻辑。
 >
 
-### 4. makeFullNode()函数 - 创建完整节点
+### 2.4. makeFullNode()函数 - 创建完整节点
 
 这是启动流程中最核心的部分，负责创建并配置完整的以太坊节点：
 
@@ -213,11 +213,28 @@ func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 }
 ```
 
+```mermaid
+graph TD
+    A[makeFullNode] --> B[makeConfigNode]
+    A --> C
+    C --> H[注册以太坊服务]
+    C --> I[注册 log filter RPC API]
+    C --> J[注册 GraphQL]
+    C --> K[注册 Ethereum Stats 服务]
+    C --> M[注册SyncTarget]
+    M --> N{开发这模式?}
+    N -->|是| P[注册模拟BeaconAPI]
+    N -->|否| Q[注册共识API]
+    P --> R[完成]
+    Q --> R
+	B --> R
+```
+
 makeFullNode主要做了两件事：
 1. 调用makeConfigNode(ctx)创建基础节点配置和容器
 2. 注册各类服务，主要是以太坊核心服务
 
-#### 4.1 makeConfigNode() - 创建基础配置
+#### 2.4.1 makeConfigNode() - 创建基础配置
 
 下面是makeConfigNode()的魔改代码，里面涉及的一些参数，后面会细化，到时做个链接过来。
 
@@ -264,7 +281,7 @@ func makeConfigNode(ctx *cli.Context) (*node.Node, gethConfig) {
 }
 ```
 
-#### 4.2 RegisterEthService() - 注册以太坊核心服务
+#### 2.4.2 RegisterEthService() - 注册以太坊核心服务
 
 ```go
 // cmd/utils/flags.go
@@ -283,7 +300,7 @@ func RegisterEthService(stack *node.Node, cfg *ethconfig.Config) (ethapi.Backend
 }
 ```
 
-### 5. startNode()函数 - 启动节点
+### 2.5. startNode()函数 - 启动节点
 
 ```go
 func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isConsole bool) {
@@ -301,15 +318,15 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 ```
 
 startNode函数主要完成：
-1. 调用stack.Start()启动所有已注册的服务 (会在节点那层详细介绍)
+1. 调用stack.Start()启动所有已注册的服务 ([详细介绍](geth启动流程解析05.md#32-启动node服务))
 2. 解锁指定账户（如果有配置） (以后介绍)
 3. 启动挖矿服务（如果有配置） (以后介绍)
 
-### 6. stack.Wait() - 等待中断信号
+### 2.6. stack.Wait() - 等待中断信号
 
 最后调用stack.Wait()使程序保持运行状态，直到收到中断信号（如Ctrl+C），然后进行清理工作并退出。
 
-## 总结
+## 3.总结
 
 Geth的启动流程虽然看起来简单，但背后涉及了大量的初始化工作：
 
@@ -320,5 +337,3 @@ Geth的启动流程虽然看起来简单，但背后涉及了大量的初始化�
 5. **运行等待** - 等待外部中断信号
 
 每个环节都有其特定的职责，共同构成了Geth完整的启动流程。
-
-麻烦的是启动流程涉及到多层调用，总结时不清楚在哪一层总结，展开太细也不好，都是细节就乱了。这个还是边写边回头修改整理吧。
