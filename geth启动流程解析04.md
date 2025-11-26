@@ -1,10 +1,10 @@
 # Geth启动流程解析 - 第四篇：以太坊核心服务初始化
 
-## 引言
+## 1.引言
 
 在Geth启动过程中，以太坊核心服务（eth.Ethereum）的初始化是最关键的环节之一。这部分负责创建和配置区块链的核心组件，包括区块链本身、交易池、共识引擎等。本文将深入分析这一过程的实现细节。
 
-## Ethereum服务结构
+## 2.Ethereum服务结构
 
 Ethereum服务是以太坊协议的核心实现，定义：
 
@@ -70,7 +70,7 @@ type Ethereum struct {
 }
 ```
 
-## Ethereum服务创建过程
+## 3.Ethereum服务创建过程
 
 Ethereum服务的创建：
 
@@ -192,7 +192,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 }
 ```
 
-## 1. 数据库初始化
+### 3.1. 数据库初始化
 
 首先，Ethereum服务需要打开区块链数据库：
 
@@ -243,7 +243,46 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 ```
 
-##  2. 区块配置信息
+打开数据库的逻辑：
+```go
+// node/node.go
+// 在data目录下根据指定的name，打开或创建一个数据库， 同时还绑定一个chain freezer（用来存储ancient数据）
+// 如果是临时节点，只需要创建内存数据库
+func (n *Node) OpenDatabaseWithFreezer(name string, cache, handles int, ancient string, namespace string, readonly bool) (ethdb.Database, error) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+	if n.state == closedState {
+		return nil, ErrNodeStopped
+	}
+	var db ethdb.Database
+	var err error
+	if n.config.DataDir == "" {
+		// 没有数据目录，则直接使用内存数据库
+		db = rawdb.NewMemoryDatabase()
+	} else {
+		// rawdb.Open打开KV数据库，返回的db对象是抽象封装，底层可以是多个库（比如chain库和ancient库）
+		// 也可以是不同类型的库实现，比如leveldb或pebble
+		db, err = rawdb.Open(rawdb.OpenOptions{
+			Type:              n.config.DBEngine,
+			Directory:         n.ResolvePath(name),
+			// 这里指定这个参数，就会同时绑定一个freezer db
+			AncientsDirectory: n.ResolveAncient(name, ancient),
+			Namespace:         namespace,
+			Cache:             cache,
+			Handles:           handles,
+			ReadOnly:          readonly,
+		})
+	}
+
+	if err == nil {
+		// 这个增加一个外层封装，支持自动Close
+		db = n.wrapDatabase(db)
+	}
+	return db, err
+}
+```
+
+###  3.2. 区块配置信息
 ```go
 	// 加载链配置（从创世区块0加载，如果没有则返回默认的params.MainnetChainConfig）
 	chainConfig, err := core.LoadChainConfig(chainDb, config.Genesis)
@@ -251,6 +290,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		return nil, err
 	}
 	// 这里会创建共识引擎实例对象
+	// 这里不展开链， 就是根据链配置中的参数信息，选择创建对应的共识引擎对象
 	engine, err := ethconfig.CreateConsensusEngine(chainConfig, chainDb)
 	if err != nil {
 		return nil, err
@@ -262,7 +302,43 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}	
 ```
 
-## 3. 区块链实例创建
+下面是加载链配置的具体逻辑：
+```go
+// core/genesis.go
+// 从数据库中加载链配置信息，一般为genesis创世时的配置，或者通过--override写入的配置
+func LoadChainConfig(db ethdb.Database, genesis *Genesis) (*params.ChainConfig, error) {
+	// 读取创世区块哈希
+	stored := rawdb.ReadCanonicalHash(db, 0)
+	if stored != (common.Hash{}) {
+		// 只读取0块中的链配置部分，其它不关注
+		storedcfg := rawdb.ReadChainConfig(db, stored)
+		if storedcfg != nil {
+			// 如果读取到，则直接返回
+			return storedcfg, nil
+		}
+	}
+
+	// 如果没有读取到创世区块的链配置，且指定链创世配置对象参数
+	if genesis != nil {
+		// 读取不到，也没指定，返回空
+		if genesis.Config == nil {
+			return nil, errGenesisNoConfig
+		}
+
+		// 如果创世区块哈希和参数指定的创世对象不匹配，则报错
+		if stored != (common.Hash{}) && genesis.ToBlock().Hash() != stored {
+			return nil, &GenesisMismatchError{stored, genesis.ToBlock().Hash()}
+		}
+		// 直接返回指定参数中的配置
+		return genesis.Config, nil
+	}
+
+	// 以上条件都不满足的情况下，返回主网默认配置
+	return params.MainnetChainConfig, nil
+}
+```
+
+### 3.3. 区块链实例创建
 
 区块链实例是Ethereum服务的核心组件之一：
 
@@ -308,12 +384,13 @@ func NewBlockChain(db ethdb.Database, chainConfig *params.ChainConfig, engine co
 }
 ```
 
-## 4.交易池初始化
+### 3.4.交易池初始化
 
 交易池负责管理待处理的交易(TODO 后面还要有交易池专题)：
 
 目前有两种交易池，传统交易池和blob交易池，分别初始化并统一放到eth.txPool
 ```go
+	// blob交易需要文件存储
 	if config.BlobPool.Datadir != "" {
 		config.BlobPool.Datadir = stack.ResolvePath(config.BlobPool.Datadir)
 	}
@@ -358,7 +435,7 @@ func New(gasTip uint64, chain BlockChain, subpools []SubPool) (*TxPool, error) {
 }
 ```
 
-## 5. 矿工初始化
+### 3.5. 矿工初始化
 
 矿工负责区块打包和共识过程：
 
@@ -390,7 +467,7 @@ func New(eth Backend, config *Config, chainConfig *params.ChainConfig, mux *even
 }
 ```
 
-## 总结
+## 4. 总结
 
 Ethereum服务的初始化过程创建了以太坊节点的所有核心组件：
 
