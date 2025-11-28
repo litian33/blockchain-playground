@@ -116,28 +116,24 @@ Canonical 数据主要包含几个映射（在 `core/rawdb/`）：
 # 6. 主要流程示意
 
 ### 6.1 Canonical KV 文件组织示意图
-
 ```mermaid
 flowchart TB
     subgraph LevelDB
-        CH[canonicalHashPrefix || blockNumber → blockHash]
-        H[headerPrefix || blockHash → RLP(header)]
-        B[bodyPrefix || blockHash → RLP(body)]
-        R[receiptPrefix || blockHash → RLP(receipts)]
-        TX[txLookupPrefix || txHash → blockHash+txIndex]
+        CH["canonicalHashPrefix || blockNumber -> blockHash"]
+        H["headerPrefix || blockHash -> RLP(header)"]
+        B["bodyPrefix || blockHash -> RLP(body)"]
+        R["receiptPrefix || blockHash -> RLP(receipts)"]
+        TX["txLookupPrefix || txHash -> blockHash+txIndex"]
     end
 
     CH --> H
     CH --> B
     CH --> R
     CH --> TX
-
-    note right of LevelDB
-        1. 所有 key-value 存储在 LevelDB
-        2. blockNumber → blockHash 是主链高度映射
-        3. header/body/receipts/txLookup 是按 blockHash 索引
-    end
 ```
+> 1. 所有 key-value 存储在 LevelDB
+> 2. blockNumber → blockHash 是主链高度映射
+> 3. header/body/receipts/txLookup 是按 blockHash 索引
 
 **说明：**
 
@@ -215,7 +211,9 @@ sequenceDiagram
 ### 6.5 串联起来
 
 这里就可以和前面介绍的 Freezer 机制串联起来，组成一个完整的流程，从 Canonical 读取数据，写入 Freezer 文件，更新 VirtualTail：
----
+
+> ⚠️ 串联这个流程的逻辑在Blockchain ->> Freezer: WriteBlock(block)，并不在 Canonical 操作中。
+
 
 ```mermaid
 sequenceDiagram
@@ -224,26 +222,20 @@ sequenceDiagram
     participant Freezer as Freezer Table
     participant User as Node/Reader
 
-    Note over BC,Canonical: 区块过旧，触发 prune/归档
-
     BC->>Canonical: Identify old blocks to prune (blockNumber n1..n2)
     Canonical-->>BC: Retrieve old blockHash, header, body, receipts
 
-    Note over BC,Freezer: 将旧块写入 Freezer
     BC->>Freezer: Append header+body+receipts to dat
     BC->>Freezer: Update idx with dat offsets
-    BC->>Freezer: Update meta (例如 item count, 文件状态)
-
-    Note over Freezer: 完成物理写入后，更新 VirtualTail
+    BC->>Freezer: Update meta (item count, file status)
     BC->>Freezer: VirtualTail += number of pruned blocks
 
-    Note over Canonical: 从 Canonical 删除 / 标记已 prune
     BC->>Canonical: Delete canonicalHash mapping for pruned blocks
-    BC->>Canonical: Optionally remove header/body/receipts for prune blocks
+    BC->>Canonical: Optionally remove header/body/receipts
 
-    Note over User, Freezer, Canonical: 节点访问逻辑
-    User->>Canonical: Read latest block → hits LevelDB
-    User->>Freezer: Read old block → skip VirtualTail 前不可读数据
+    User->>Canonical: Read latest block
+    User->>Freezer: Read old block (skip VirtualTail items)
+
 ```
 
 ---
@@ -323,4 +315,9 @@ func ReadCanonicalHash(db Database, number uint64) common.Hash {
   * **Freezer = 历史不可变数据**（append-only + VirtualTail）
 * reorg / prune / repair 机制与 Freezer 协作确保节点完整性
 
----
+> ⚠️ 非常重要的一点：Canonical 数据是平面化的，不是结构化数据，也不是状态数据，所有数据全部是 KV 结构，根据各种 KEY 索引的。这样就很容易理解了：
+> 1. 把区块高度作为 Key，存储区块哈希；
+> 1. 把一个区块的数据拆分成几部分，使用区块哈希和不同的前缀作为 Key 存储；
+> 1. 把交易哈希作为 Key 存储交易数据；
+> 
+> 如此简单而已！
