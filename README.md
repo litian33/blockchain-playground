@@ -5,12 +5,12 @@ Blockchain playground
 
 ### 待总结计划
 
-- [x] geth启动流程
-- [ ] geth创世
-- [ ] txpool
+- [x] Geth启动流程
+- [x] Geth创世
+- [x] 存储结构
 - [ ] p2p逻辑
+- [ ] txpool
 - [ ] GPO价格预言机
 - [ ] 矿工逻辑
-- [ ] 存储结构
 - [ ] 分叉机制
 - [ ] 共识引擎
