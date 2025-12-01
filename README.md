@@ -8,7 +8,7 @@ Blockchain playground
 - [x] Geth启动流程
 - [x] Geth创世
 - [x] 存储结构
-- [ ] p2p逻辑
+- [x] p2p逻辑
 - [ ] txpool
 - [ ] GPO价格预言机
 - [ ] 矿工逻辑
