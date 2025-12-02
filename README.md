@@ -10,7 +10,7 @@ Blockchain playground
 - [x] 存储结构
 - [x] p2p逻辑
 - [x] txpool
-- [ ] GPO价格预言机
+- [x] 燃料费估算机制
 - [ ] 矿工逻辑
 - [ ] 分叉机制
 - [ ] 共识引擎
