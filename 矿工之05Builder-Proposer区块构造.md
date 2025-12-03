@@ -125,6 +125,80 @@ sequenceDiagram
 4. CL 调用 `engine_getPayload` 获取完整 block payload
 5. EL 验证 payload → 导入链
 
+下面是各组件之间的整体协作图：
+
+```mermaid
+flowchart TD
+    %% ---------------------------
+    %% 用户交易
+    %% ---------------------------
+    U[Wallet 用户] -->|发送交易| N[Full Node / RPC 节点]
+
+    %% ---------------------------
+    %% Searcher
+    %% ---------------------------
+    subgraph S[Searcher 节点]
+        S1[发现套利机会 / MEV]
+        S2[构造 Bundle]
+        S3[提交给 Builder]
+    end
+
+    N -->|交易广播| S1
+    S2 --> S3
+
+    %% ---------------------------
+    %% Builder
+    %% ---------------------------
+    subgraph B[Builder 节点]
+        B1[收集公共交易池 + 私有 bundle]
+        B2[交易排序 + MEV 优化]
+        B3[EVM 模拟 + 计算区块价值]
+        B4[生成区块 Header + Body]
+        B5[发送 Header/Bid 给 Relay]
+    end
+
+    S3 --> B1
+    B1 --> B2 --> B3 --> B4 --> B5
+
+    %% ---------------------------
+    %% Relay
+    %% ---------------------------
+    subgraph R[Relay 节点]
+        R1[接收 Builder Bid]
+        R2[选择最佳 Block]
+        R3[发送 Header 给 Validator]
+        R4[收到签名后发送完整 Block Body 给 EL]
+    end
+
+    B5 --> R1
+    R1 --> R2 --> R3
+
+    %% ---------------------------
+    %% Validator + Consensus Client
+    %% ---------------------------
+    subgraph V["Validator 节点 (Consensus Client)"]
+        V1[Slot 到达，作为 Proposer]
+        V2["engine_getPayloadV2() 获取 Header"]
+        V3[验证 Header]
+        V4[签名 Block Header]
+        V5["engine_forkchoiceUpdatedV2() 发送签名给 Relay"]
+    end
+
+    R3 --> V1 --> V2 --> V3 --> V4 --> V5 --> R4
+
+    %% ---------------------------
+    %% Execution Layer
+    %% ---------------------------
+    subgraph E["Execution Client (EL, 如 Geth)"]
+        E1[接收完整 Block Body]
+        E2[验证交易合法性 + EVM 执行]
+        E3[更新 StateDB / 写入链]
+        E4[广播给其他节点]
+    end
+
+    R4 --> E1 --> E2 --> E3 --> E4
+
+```
 ---
 
 # 四、Builder 的区块构造流程
