@@ -1,32 +1,126 @@
 
 
-基于您的需求和代码分析，我为您撰写了一份关于triedb过大、长时间不回收导致关闭时出现悬空节点问题的技术分析文档：
+# Triedb过大问题分析
 
-# Triedb悬空节点问题分析报告
+## 问题现象
 
-## 问题概述
+```log
+INFO [12-04|11:29:47.010] Imported new chain segment               number=21,904,766 hash=19b036..820587 blocks=1    txs=7       mgas=0.474    elapsed=6.096ms     mgasps=77.701   snapdiffs=2.77MiB    triedirty=1.22GiB
 
-在节点关闭时出现"Dangling trie nodes after full cleanup"错误，同时观察到triedirty高达1.22GiB，表明系统中存在大量未被正确回收的Trie节点。这个问题的根本原因是triedb过大且长时间未能得到适当清理。
+INFO [12-04|11:30:16.372] Persisted trie from memory database      nodes=8,175,591  size=1.19GiB   time=41.880221408s gcnodes=183,009,819 gcsize=67.02GiB gctime=11m8.39589783s   livenodes=21475 livesize=8.26MiB
+
+ERROR[12-04|11:30:16.442] Dangling trie nodes after full cleanup
+```
+
+如上面的日志所示：
+1. 第一条日志，正常运行中，triedb 脏数据占内存为1.22GiB；
+1. 第二条日志，关机时清理脏数据，triedb gc 统计信息，回收数据67.02GiB，统计回收时长11 分多；
+1. 第三条日志，所有内存数据回收完毕后，triedb 存在孤儿节点。
+
 
 ## 核心原因分析
 
-### 1. TrieTimeLimit设置不当
+### 1. triedb 清理相关逻辑
 
-从您修改的代码中可以看到：
+从代码中可以看到：
 ```go
-// 这里的缓存超时时间默认 1 小时，太久，修改为默认 1 分钟（每个块耗时0.05 秒，差不多 1200 个区块）
-TrieTimeout: 5 * time.Minute,
+// eth/ethconfig/config.go
+// Defaults contains default settings for use on the Ethereum main net.
+var Defaults = Config{
+    // ...
+	// 这里的缓存超时时间默认 1 小时
+	TrieTimeout:        60 * time.Minute,
+	// ...
+}
 ```
 
-尽管您已将TrieTimeLimit从1小时调整为5分钟，但对于高频出块网络（每秒一个区块），仍需要约100分钟才能触发一次提交操作：
 ```go
-// 每个区块增加约0.05秒
-bc.gcproc += proctime
+// core/blockchain.go
+func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis, overrides *ChainOverrides, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(header *types.Header) bool, txLookupLimit *uint64) (*BlockChain, error) {
+    // ...
+    // 使用TrieTimeout设置缓存超时
+	bc.flushInterval.Store(int64(cacheConfig.TrieTimeLimit))
+    // ...
+}
+
+
+func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.Receipt, state *state.StateDB) error {
+	// ...
+    
+	// 如果是 archive 模式, 直接提交缓存
+	if bc.cacheConfig.TrieDirtyDisabled {
+		return bc.triedb.Commit(root, false)
+	}
+	// full 模式下，新加区块时，添加状态根引用和 triegc 记录
+	bc.triedb.Reference(root, common.Hash{}) 
+	// 注意这里记录的区块的优先级是区块高度的负值，就是越新的区块优先级越低，越旧的区块优先级越高
+	bc.triegc.Push(root, -int64(block.NumberU64()))
+
+
+	// 链的前 128 个块不做任何处理，直接缓存
+	current := block.NumberU64()
+	if current <= TriesInMemory {
+		return nil
+	}
+	var (
+        // 获取 triesdb 和预映像的大小
+		_, nodes, imgs = bc.triedb.Size() 
+		// 这个值是--cache.gc 参数指定的，默认为cache 的25%
+		limit = common.StorageSize(bc.cacheConfig.TrieDirtyLimit) * 1024 * 1024
+	)
+    // 如果缓存大小超过回收阈值，或者预映像大小超过4M，则开始回收
+	if nodes > limit || imgs > 4*1024*1024 {
+		// 如果 triedb 内存数据大于回收阈值，则每次减小IdealBatchSize大小
+		// 比如我设置的triedb 缓存大小为 512M，在内存超限之后，它每次减小 100KB
+		bc.triedb.Cap(limit - ethdb.IdealBatchSize)
+	}
+
+	// 往前推128 个块
+	chosen := current - TriesInMemory
+	// 缓存刷新间隔，注意这里，默认是 1 小时
+	flushInterval := time.Duration(bc.flushInterval.Load())
+
+	// 如果超过时间限制，则刷新一个 tries 到磁盘
+	log.Debug("Syncing state trie to disk", "gcproc", bc.gcproc, "limit", flushInterval)
+	if bc.gcproc > flushInterval {
+		// 获取Head-128块的Header
+		header := bc.GetHeaderByNumber(chosen)
+		if header == nil {
+			log.Warn("Reorg in progress, trie commit postponed", "number", chosen)
+		} else {
+			// 如果到了清理阈值，但是超过 2 个周期，还没有被清理，发出告警
+			if chosen < bc.lastWrite+TriesInMemory && bc.gcproc >= 2*flushInterval {
+				log.Info("State in memory for too long, committing", "time", bc.gcproc, "allowance", flushInterval, "optimum", float64(chosen-bc.lastWrite)/TriesInMemory)
+			}
+			// 提交一个完整的 tries 到磁盘，并清理 gc 统计数据
+			bc.triedb.Commit(header.Root, true)
+
+			// 记录提交时间和高度
+			bc.lastWrite = chosen
+			bc.gcproc = 0
+		}
+	}
+
+	// 下面这个逻辑一般会保证清除掉 128 个之前的区块
+	for !bc.triegc.Empty() {
+		// 取出最高优先级的 tries（其实就是最老的区块）
+		root, number := bc.triegc.Pop()
+		if uint64(-number) > chosen {
+			// 如果最老的区块高度，还没有达到清理阈值，则重新压入堆中，下次再清理
+			bc.triegc.Push(root, number)
+			break
+		}
+		// 删除 trie 数据
+		bc.triedb.Dereference(root)
+	}
+	return nil
+
+}
 ```
 
 ### 2. 内存清理机制失效
 
-在正常运行时，系统有两个清理机制：
+在正常运行时，系统有三个清理机制：
 
 1. **定时清理** - 当`bc.gcproc > flushInterval`时触发：
 ```go
@@ -43,7 +137,17 @@ if nodes > limit || imgs > 4*1024*1024 {
 }
 ```
 
-但在实际运行中，这两个机制可能都未能有效工作，导致triedirty累积到1.22GiB。
+3. **triedirty阈值清理** - 当triedirty超过限制时：
+```go
+	// 下面这个逻辑一般会保证清除掉 128 个之前的区块
+	for !bc.triegc.Empty() {
+		// 删除 trie 数据
+		bc.triedb.Dereference(root)
+	}
+```
+
+
+但在实际运行中，这三个机制可能都未能有效工作，导致triedirty累积到1.22GiB。
 
 ### 3. 关闭时的清理不彻底
 
@@ -65,7 +169,7 @@ if _, nodes, _ := triedb.Size(); nodes != 0 {
 
 在hashdb中，节点通过以下方式管理：
 
-1. **引用计数机制** - [cachedNode.parents](file:///Users/litian/code/work/chain/chain.me/triedb/hashdb/database.go#L137-L137)跟踪节点被引用次数
+1. **引用计数机制** - [cachedNode.parents]跟踪节点被引用次数
 2. **flush-list双向链表** - 按时间顺序维护脏节点
 3. **脏节点缓存** - `db.dirties`存储所有未提交的节点
 
@@ -74,6 +178,38 @@ if _, nodes, _ := triedb.Size(); nodes != 0 {
 1. **引用计数未正确减少** - 当节点不再需要时，其引用计数未能及时减少到0
 2. **循环引用** - 可能存在节点间的循环引用，导致无法被垃圾回收
 3. **异常退出** - 在某些异常情况下，节点的引用关系未能正确清理
+
+### 根本原因分析
+因为在正常情况下这个问题不是每次出现（悬空节点），而 triedb 的内存管理机制是一贯的，所以暂时不考虑处理机制的问题。
+还是出现在清理逻辑的触发点可能有问题，导致没有及时触发，缓存一直累积，上面日志中超大的缓存也可以看出这方面的问题。
+
+经过详细研读代码，发现问题出现在`bc.gcproc`的计算逻辑上。
+正常情况下，如果`flushInterval`阈值为 1 小时，每隔 1 小时就会执行一次 Commit，但是日志中并没有搜索到相关信息：
+```go
+logger("Persisted trie from memory database", "nodes", nodes-len(db.dirties)+int(db.flushnodes), "size", storage-db.dirtiesSize+db.flushsize, "time", time.Since(start)+db.flushtime,
+		"gcnodes", db.gcnodes, "gcsize", db.gcsize, "gctime", db.gctime, "livenodes", len(db.dirties), "livesize", db.dirtiesSize)
+
+```
+
+```go
+// core/blockchain.go
+func (bc *BlockChain) insertChain(chain types.Blocks, setHead bool) (int, error) {
+    // ...
+    // bc.gcproc只统计真实的区块处理时间，通过日志观察，每个区块大约0.05 秒
+    bc.gcproc += proctime
+    // ...
+}
+```
+
+结合之前的代码就可以分析出，多久执行一次 Commit 操作：
+```go
+    1 hour / 0.05 second = 72000
+```
+
+也就是需要经过72000 个区块，Triedb 才能被清理一次，这个时间大概是1 天。
+
+如果不清理，Triedb 就会一直占用内存，节点的引用计数也不会清理，另外两种缓存清理机制也无法彻底清理。
+
 
 ## 解决方案建议
 
@@ -84,35 +220,17 @@ if _, nodes, _ := triedb.Size(); nodes != 0 {
 TrieTimeout: 1 * time.Minute,
 ```
 
-### 2. 增强内存监控和清理
+只需要修改这一个地方，因为没有启动参数可以指定，只能在代码中修改默认值。
 
-加强内存阈值检查的频率和有效性：
-```go
-// 增加检查频率，不仅依赖时间，也要依赖内存增长情况
-if nodes > limit || imgs > 4*1024*1024 || bc.gcproc > flushInterval {
-    // 执行清理操作
-}
-```
+### 2. 修改后效果
 
-### 3. 改进关闭清理流程
+会定期打印“Persisted trie from memory database”日志，但是时间间隔还是比较久，原因是链上的区块处理比较快，很多块只有几笔交易，处理时间0.001 秒，这样累积满 1 分钟的时间就被大大推迟。
 
-增强关闭时的清理机制，确保所有节点都被正确处理：
-```go
-// 在Stop函数中增加更强的清理逻辑
-for !bc.triegc.Empty() {
-    triedb.Dereference(bc.triegc.PopItem())
-}
+不过目前已经规避了超大内存不回收，关闭错误的问题。
 
-// 添加额外的安全检查和强制清理
-if _, nodes, _ := triedb.Size(); nodes != 0 {
-    // 尝试强制清理
-    triedb.ForceCleanup()
-    // 再次检查
-    if _, nodes, _ := triedb.Size(); nodes != 0 {
-        log.Warn("Still have dangling nodes after force cleanup", "nodes", nodes)
-    }
-}
-```
+预计 1500 个块会回收一次，根据链上负载不同，可能会 10000 个块才会回收。
+
+需要考虑优化手段，比如结合时间和块数来综合判断回收时间。
 
 ## 总结
 
