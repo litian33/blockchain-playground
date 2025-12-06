@@ -11,6 +11,5 @@ Blockchain playground
 - [x] p2p逻辑
 - [x] txpool
 - [x] 燃料费估算机制
-- [ ] 矿工逻辑
-- [ ] 分叉机制
-- [ ] 共识引擎
+- [x] 矿工逻辑
+- [x] 共识引擎
